@@ -24,7 +24,7 @@ jobs:
           password: ${{ secrets.CODING_TOKEN }}
 
       - name: Run docker compose and Push Docker image
-        uses: shining-so/compose-action@v2.3.0
+        uses: shining-so/compose-action@v2.3.1
         with:
           compose-file: "./docker-compose.yaml"
         env:
@@ -37,3 +37,4 @@ jobs:
           REDIS_RATE_LIMIT_URL: "redis://redis:6379"
           PLAYWRIGHT_MICROSERVICE_URL: "http://playwright-service:3000/html"
           USE_DB_AUTHENTICATION: "false"
+          LOGGING_LEVEL: "ERROR"
