@@ -14,6 +14,7 @@ x-common-service: &common-service
 services:
   playwright-service:
     build: apps/playwright-service
+    image: ${DOCKER_REGISTRY}/firecrawl-prod/playwright-service:${IMAGE_TAG}
     environment:
       - PORT=3000
       - PROXY_SERVER=${PROXY_SERVER}
@@ -25,6 +26,7 @@ services:
 
   api:
     <<: *common-service
+    image: ${DOCKER_REGISTRY}/firecrawl-prod/api:${IMAGE_TAG}
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
@@ -61,6 +63,7 @@ services:
 
   worker:
     <<: *common-service
+    image: ${DOCKER_REGISTRY}/firecrawl-prod/worker:${IMAGE_TAG}
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
