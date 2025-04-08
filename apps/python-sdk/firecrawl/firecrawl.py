@@ -12,7 +12,7 @@ Classes:
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Dict, Optional, List, Union, Callable
 import json
 
 import requests
@@ -40,6 +40,40 @@ class GenerateLLMsTextParams(pydantic.BaseModel):
     maxUrls: Optional[int] = 10
     showFullText: Optional[bool] = False
     __experimental_stream: Optional[bool] = None
+
+class DeepResearchParams(pydantic.BaseModel):
+    """
+    Parameters for the deep research operation.
+    """
+    maxDepth: Optional[int] = 7
+    timeLimit: Optional[int] = 270
+    maxUrls: Optional[int] = 20
+    analysisPrompt: Optional[str] = None
+    systemPrompt: Optional[str] = None
+    __experimental_streamSteps: Optional[bool] = None
+
+class DeepResearchResponse(pydantic.BaseModel):
+    """
+    Response from the deep research operation.
+    """
+    success: bool
+    id: str
+    error: Optional[str] = None
+
+class DeepResearchStatusResponse(pydantic.BaseModel):
+    """
+    Status response from the deep research operation.
+    """
+    success: bool
+    data: Optional[Dict[str, Any]] = None
+    status: str
+    error: Optional[str] = None
+    expiresAt: str
+    currentDepth: int
+    maxDepth: int
+    activities: List[Dict[str, Any]]
+    sources: List[Dict[str, Any]]
+    summaries: List[str]
 
 class FirecrawlApp:
     class SearchResponse(pydantic.BaseModel):
@@ -145,6 +179,7 @@ class FirecrawlApp:
             f'{self.api_url}{endpoint}',
             headers=headers,
             json=scrape_params,
+            timeout=(scrape_params["timeout"] + 5000 if "timeout" in scrape_params else None),
         )
         if response.status_code == 200:
             try:
@@ -433,7 +468,7 @@ class FirecrawlApp:
         else:
             self._handle_error(response, 'map')
 
-    def batch_scrape_urls(self, urls: list[str],
+    def batch_scrape_urls(self, urls: List[str],
                   params: Optional[Dict[str, Any]] = None,
                   poll_interval: Optional[int] = 2,
                   idempotency_key: Optional[str] = None) -> Any:
@@ -441,7 +476,7 @@ class FirecrawlApp:
         Initiate a batch scrape job for the specified URLs using the Firecrawl API.
 
         Args:
-            urls (list[str]): The URLs to scrape.
+            urls (List[str]): The URLs to scrape.
             params (Optional[Dict[str, Any]]): Additional parameters for the scraper.
             poll_interval (Optional[int]): Time in seconds between status checks when waiting for job completion. Defaults to 2 seconds.
             idempotency_key (Optional[str]): A unique uuid key to ensure idempotency of requests.
@@ -476,12 +511,12 @@ class FirecrawlApp:
             self._handle_error(response, 'start batch scrape job')
 
 
-    def async_batch_scrape_urls(self, urls: list[str], params: Optional[Dict[str, Any]] = None, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+    def async_batch_scrape_urls(self, urls: List[str], params: Optional[Dict[str, Any]] = None, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         """
         Initiate a crawl job asynchronously.
 
         Args:
-            urls (list[str]): The URLs to scrape.
+            urls (List[str]): The URLs to scrape.
             params (Optional[Dict[str, Any]]): Additional parameters for the scraper.
             idempotency_key (Optional[str]): A unique uuid key to ensure idempotency of requests.
 
@@ -505,12 +540,12 @@ class FirecrawlApp:
         else:
             self._handle_error(response, 'start batch scrape job')
     
-    def batch_scrape_urls_and_watch(self, urls: list[str], params: Optional[Dict[str, Any]] = None, idempotency_key: Optional[str] = None) -> 'CrawlWatcher':
+    def batch_scrape_urls_and_watch(self, urls: List[str], params: Optional[Dict[str, Any]] = None, idempotency_key: Optional[str] = None) -> 'CrawlWatcher':
         """
         Initiate a batch scrape job and return a CrawlWatcher to monitor the job via WebSocket.
 
         Args:
-            urls (list[str]): The URLs to scrape.
+            urls (List[str]): The URLs to scrape.
             params (Optional[Dict[str, Any]]): Additional parameters for the scraper.
             idempotency_key (Optional[str]): A unique uuid key to ensure idempotency of requests.
 
@@ -613,12 +648,12 @@ class FirecrawlApp:
         else:
             self._handle_error(response, "check batch scrape errors")
 
-    def extract(self, urls: List[str], params: Optional[ExtractParams] = None) -> Any:
+    def extract(self, urls: Optional[List[str]] = None, params: Optional[ExtractParams] = None) -> Any:
         """
         Extracts information from a URL using the Firecrawl API.
 
         Args:
-            urls (List[str]): The URLs to extract information from.
+            urls (Optional[List[str]]): The URLs to extract information from.
             params (Optional[ExtractParams]): Additional parameters for the extract request.
 
         Returns:
@@ -629,6 +664,9 @@ class FirecrawlApp:
         if not params or (not params.get('prompt') and not params.get('schema')):
             raise ValueError("Either prompt or schema is required")
 
+        if not urls and not params.get('prompt'):
+            raise ValueError("Either urls or prompt is required")
+
         schema = params.get('schema')
         if schema:
             if hasattr(schema, 'model_json_schema'):
@@ -636,15 +674,24 @@ class FirecrawlApp:
                 schema = schema.model_json_schema()
             # Otherwise assume it's already a JSON schema dict
 
-        jsonData = {'urls': urls, **params}
         request_data = {
-            **jsonData,
+            'urls': urls,
             'allowExternalLinks': params.get('allow_external_links', params.get('allowExternalLinks', False)),
-            'enableWebSearch': params.get('enable_web_search', params.get('enableWebSearch', False)),
+            'enableWebSearch': params.get('enable_web_search', params.get('enableWebSearch', False)), 
             'showSources': params.get('show_sources', params.get('showSources', False)),
             'schema': schema,
             'origin': 'api-sdk'
         }
+
+        if not request_data['urls']:
+            request_data['urls'] = []
+        # Only add prompt and systemPrompt if they exist
+        if params.get('prompt'):
+            request_data['prompt'] = params['prompt']
+        if params.get('system_prompt'):
+            request_data['systemPrompt'] = params['system_prompt']
+        elif params.get('systemPrompt'):  # Check legacy field name
+            request_data['systemPrompt'] = params['systemPrompt']
 
         try:
             # Send the initial extract request
@@ -925,7 +972,7 @@ class FirecrawlApp:
             requests.RequestException: If the request fails after the specified retries.
         """
         for attempt in range(retries):
-            response = requests.post(url, headers=headers, json=data)
+            response = requests.post(url, headers=headers, json=data, timeout=((data["timeout"] + 5000) if "timeout" in data else None))
             if response.status_code == 502:
                 time.sleep(backoff_factor * (2 ** attempt))
             else:
@@ -1053,6 +1100,8 @@ class FirecrawlApp:
 
         if response.status_code == 402:
             message = f"Payment Required: Failed to {action}. {error_message} - {error_details}"
+        elif response.status_code == 403:
+            message = f"Website Not Supported: Failed to {action}. {error_message} - {error_details}"
         elif response.status_code == 408:
             message = f"Request Timeout: Failed to {action} as the request timed out. {error_message} - {error_details}"
         elif response.status_code == 409:
@@ -1064,6 +1113,140 @@ class FirecrawlApp:
 
         # Raise an HTTPError with the custom message and attach the response
         raise requests.exceptions.HTTPError(message, response=response)
+
+    def deep_research(self, query: str, params: Optional[Union[Dict[str, Any], DeepResearchParams]] = None, 
+                     on_activity: Optional[Callable[[Dict[str, Any]], None]] = None,
+                     on_source: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+        """
+        Initiates a deep research operation on a given query and polls until completion.
+
+        Args:
+            query (str): The query to research.
+            params (Optional[Union[Dict[str, Any], DeepResearchParams]]): Parameters for the deep research operation.
+            on_activity (Optional[Callable[[Dict[str, Any]], None]]): Optional callback to receive activity updates in real-time.
+
+        Returns:
+            Dict[str, Any]: The final research results.
+
+        Raises:
+            Exception: If the research operation fails.
+        """
+        if params is None:
+            params = {}
+
+        if isinstance(params, dict):
+            research_params = DeepResearchParams(**params)
+        else:
+            research_params = params
+
+        response = self.async_deep_research(query, research_params)
+        if not response.get('success') or 'id' not in response:
+            return response
+
+        job_id = response['id']
+        last_activity_count = 0
+        last_source_count = 0
+
+        while True:
+            status = self.check_deep_research_status(job_id)
+            
+            if on_activity and 'activities' in status:
+                new_activities = status['activities'][last_activity_count:]
+                for activity in new_activities:
+                    on_activity(activity)
+                last_activity_count = len(status['activities'])
+            
+            if on_source and 'sources' in status:
+                new_sources = status['sources'][last_source_count:]
+                for source in new_sources:
+                    on_source(source)
+                last_source_count = len(status['sources'])
+            
+            if status['status'] == 'completed':
+                return status
+            elif status['status'] == 'failed':
+                raise Exception(f'Deep research failed. Error: {status.get("error")}')
+            elif status['status'] != 'processing':
+                break
+
+            time.sleep(2)  # Polling interval
+
+        return {'success': False, 'error': 'Deep research job terminated unexpectedly'}
+    def async_deep_research(self, query: str, params: Optional[Union[Dict[str, Any], DeepResearchParams]] = None) -> Dict[str, Any]:
+        """
+        Initiates an asynchronous deep research operation.
+
+        Args:
+            query (str): The query to research.
+            params (Optional[Union[Dict[str, Any], DeepResearchParams]]): Parameters for the deep research operation.
+
+        Returns:
+            Dict[str, Any]: The response from the deep research initiation.
+
+        Raises:
+            Exception: If the research initiation fails.
+        """
+        if params is None:
+            params = {}
+
+        if isinstance(params, dict):
+            research_params = DeepResearchParams(**params)
+        else:
+            research_params = params
+
+        headers = self._prepare_headers()
+        
+        json_data = {'query': query, **research_params.dict(exclude_none=True)}
+
+        # Handle json options schema if present
+        if 'jsonOptions' in json_data:
+            json_opts = json_data['jsonOptions']
+            if json_opts and 'schema' in json_opts and hasattr(json_opts['schema'], 'schema'):
+                json_data['jsonOptions']['schema'] = json_opts['schema'].schema()
+
+        try:
+            response = self._post_request(f'{self.api_url}/v1/deep-research', json_data, headers)
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except:
+                    raise Exception('Failed to parse Firecrawl response as JSON.')
+            else:
+                self._handle_error(response, 'start deep research')
+        except Exception as e:
+            raise ValueError(str(e))
+
+        return {'success': False, 'error': 'Internal server error'}
+
+    def check_deep_research_status(self, id: str) -> Dict[str, Any]:
+        """
+        Check the status of a deep research operation.
+
+        Args:
+            id (str): The ID of the deep research operation.
+
+        Returns:
+            Dict[str, Any]: The current status and results of the research operation.
+
+        Raises:
+            Exception: If the status check fails.
+        """
+        headers = self._prepare_headers()
+        try:
+            response = self._get_request(f'{self.api_url}/v1/deep-research/{id}', headers)
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except:
+                    raise Exception('Failed to parse Firecrawl response as JSON.')
+            elif response.status_code == 404:
+                raise Exception('Deep research job not found')
+            else:
+                self._handle_error(response, 'check deep research status')
+        except Exception as e:
+            raise ValueError(str(e))
+
+        return {'success': False, 'error': 'Internal server error'}
 
 class CrawlWatcher:
     def __init__(self, id: str, app: FirecrawlApp):

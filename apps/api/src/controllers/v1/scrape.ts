@@ -19,12 +19,22 @@ export async function scrapeController(
   req: RequestWithAuth<{}, ScrapeResponse, ScrapeRequest>,
   res: Response<ScrapeResponse>,
 ) {
+  const jobId = uuidv4();
+  const preNormalizedBody = { ...req.body };
+ 
+  logger.debug("Scrape " + jobId + " starting", {
+    scrapeId: jobId,
+    request: req.body,
+    originalRequest: preNormalizedBody,
+    teamId: req.auth.team_id,
+    account: req.account,
+  });
+
   req.body = scrapeRequestSchema.parse(req.body);
   let earlyReturn = false;
 
   const origin = req.body.origin;
   const timeout = req.body.timeout;
-  const jobId = uuidv4();
 
   const startTime = new Date().getTime();
   const jobPriority = await getJobPriority({
@@ -32,6 +42,7 @@ export async function scrapeController(
     team_id: req.auth.team_id,
     basePriority: 10,
   });
+  // 
 
   await addScrapeJob(
     {
@@ -39,7 +50,7 @@ export async function scrapeController(
       mode: "single_urls",
       team_id: req.auth.team_id,
       scrapeOptions: req.body,
-      internalOptions: {},
+      internalOptions: { teamId: req.auth.team_id },
       plan: req.auth.plan!,
       origin: req.body.origin,
       is_scrape: true,

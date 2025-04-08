@@ -12,6 +12,7 @@ import {
   deepResearchQueueName,
   getIndexQueue,
   getGenerateLlmsTxtQueue,
+  getBillingQueue,
 } from "./queue-service";
 import { startWebScraperPipeline } from "../main/runWebScraper";
 import { callWebhook } from "./webhook";
@@ -27,6 +28,7 @@ import {
   addCrawlJobs,
   crawlToCrawler,
   finishCrawl,
+  finishCrawlPre,
   finishCrawlKickoff,
   generateURLPermutations,
   getCrawl,
@@ -99,7 +101,89 @@ const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
 const runningJobs: Set<string> = new Set();
 
 async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
-  if (await finishCrawl(job.data.crawl_id)) {
+  if (await finishCrawlPre(job.data.crawl_id)) {
+    if (job.data.crawlerOptions && !await redisConnection.exists("crawl:" + job.data.crawl_id + ":invisible_urls")) {
+      await redisConnection.set("crawl:" + job.data.crawl_id + ":invisible_urls", "done", "EX", 60 * 60 * 24);
+
+      const sc = (await getCrawl(job.data.crawl_id))!;
+
+      const visitedUrls = new Set(await redisConnection.smembers(
+        "crawl:" + job.data.crawl_id + ":visited_unique",
+      ));
+
+      const lastUrls: string[] = ((await supabase_service.rpc("diff_get_last_crawl_urls", {
+        i_team_id: job.data.team_id,
+        i_url: sc.originUrl!,
+      })).data ?? []).map(x => x.url);
+
+      const lastUrlsSet = new Set(lastUrls);
+
+      const crawler = crawlToCrawler(
+        job.data.crawl_id,
+        sc,
+        sc.originUrl!,
+        job.data.crawlerOptions,
+      );
+
+      const univistedUrls = crawler.filterLinks(
+        Array.from(lastUrlsSet).filter(x => !visitedUrls.has(x)),
+        Infinity,
+        sc.crawlerOptions.maxDepth ?? 10,
+      );
+      
+      const addableJobCount = sc.crawlerOptions.limit === undefined ? Infinity : (sc.crawlerOptions.limit - await getDoneJobsOrderedLength(job.data.crawl_id));
+
+      console.log(sc.originUrl!, univistedUrls, visitedUrls, lastUrls, addableJobCount);
+
+      if (univistedUrls.length !== 0 && addableJobCount > 0) {
+        const jobs = univistedUrls.slice(0, addableJobCount).map((url) => {
+          const uuid = uuidv4();
+          return {
+            name: uuid,
+            data: {
+              url,
+              mode: "single_urls" as const,
+              team_id: job.data.team_id,
+              plan: job.data.plan!,
+              crawlerOptions: {
+                ...job.data.crawlerOptions,
+                urlInvisibleInCurrentCrawl: true,
+              },
+              scrapeOptions: job.data.scrapeOptions,
+              internalOptions: sc.internalOptions,
+              origin: job.data.origin,
+              crawl_id: job.data.crawl_id,
+              sitemapped: true,
+              webhook: job.data.webhook,
+              v1: job.data.v1,
+            },
+            opts: {
+              jobId: uuid,
+              priority: 20,
+            },
+          };
+        });
+
+        const lockedIds = await lockURLsIndividually(
+          job.data.crawl_id,
+          sc,
+          jobs.map((x) => ({ id: x.opts.jobId, url: x.data.url })),
+        );
+        const lockedJobs = jobs.filter((x) =>
+          lockedIds.find((y) => y.id === x.opts.jobId),
+        );
+        await addCrawlJobs(
+          job.data.crawl_id,
+          lockedJobs.map((x) => x.opts.jobId),
+        );
+        await addScrapeJobs(lockedJobs);
+
+        return;
+      }
+    }
+
+    await finishCrawl(job.data.crawl_id);
+
     (async () => {
       const originUrl = sc.originUrl
         ? normalizeUrlOnlyHostname(sc.originUrl)
@@ -406,10 +490,15 @@ const processDeepResearchJobInternal = async (
       researchId: job.data.researchId,
       teamId: job.data.teamId,
       plan: job.data.plan,
-      topic: job.data.request.topic,
+      query: job.data.request.query,
       maxDepth: job.data.request.maxDepth,
       timeLimit: job.data.request.timeLimit,
       subId: job.data.subId,
+      maxUrls: job.data.request.maxUrls,
+      analysisPrompt: job.data.request.analysisPrompt,
+      systemPrompt: job.data.request.systemPrompt,
+      formats: job.data.request.formats,
+      jsonOptions: job.data.request.jsonOptions,
     });  
     
     if(result.success) {
@@ -565,7 +654,8 @@ const workerFun = async (
     const token = uuidv4();
     const canAcceptConnection = await monitor.acceptConnection();
     if (!canAcceptConnection) {
-      console.log("Cant accept connection");
+      console.log("Can't accept connection due to RAM/CPU load");
+      logger.info("Can't accept connection due to RAM/CPU load");
       cantAcceptConnectionCount++;
 
       if (cantAcceptConnectionCount >= 25) {
@@ -920,6 +1010,10 @@ async function processJob(job: Job & { id: string }, token: string) {
       delete doc.rawHtml;
     }
 
+    if (job.data.concurrencyLimited) {
+      doc.warning = "This scrape job was throttled at your current concurrency limit. If you'd like to scrape faster, you can upgrade your plan." + (doc.warning ? " " + doc.warning : "");
+    }
+
     const data = {
       success: true,
       result: {
@@ -971,7 +1065,13 @@ async function processJob(job: Job & { id: string }, token: string) {
           ); // TODO: make this its own error type that is ignored by error tracking
         }
 
-        if (job.data.isCrawlSourceScrape) {
+        // Only re-set originUrl if it's different from the current hostname
+        // This is only done on this condition to handle cross-domain redirects
+        // If this would be done for non-crossdomain redirects, but also for e.g.
+        // redirecting / -> /introduction (like our docs site does), it would
+        // break crawling the entire site without allowBackwardsCrawling - mogery
+        const isHostnameDifferent = normalizeUrlOnlyHostname(doc.metadata.url) !== normalizeUrlOnlyHostname(doc.metadata.sourceURL);
+        if (job.data.isCrawlSourceScrape && isHostnameDifferent) {
           // TODO: re-fetch sitemap for redirect target domain
           sc.originUrl = doc.metadata.url;
           await saveCrawl(job.data.crawl_id, sc);
@@ -1036,6 +1136,7 @@ async function processJob(job: Job & { id: string }, token: string) {
             job.data.crawl_id,
             sc,
             doc.metadata.url ?? doc.metadata.sourceURL ?? sc.originUrl!,
+            job.data.crawlerOptions,
           );
 
           const links = crawler.filterLinks(
@@ -1080,6 +1181,10 @@ async function processJob(job: Job & { id: string }, token: string) {
                   team_id: sc.team_id,
                   scrapeOptions: scrapeOptions.parse(sc.scrapeOptions),
                   internalOptions: sc.internalOptions,
+                  crawlerOptions: {
+                    ...sc.crawlerOptions,
+                    currentDiscoveryDepth: (job.data.crawlerOptions?.currentDiscoveryDepth ?? 0) + 1,
+                  },
                   plan: job.data.plan,
                   origin: job.data.origin,
                   crawl_id: job.data.crawl_id,
@@ -1104,6 +1209,11 @@ async function processJob(job: Job & { id: string }, token: string) {
               // });
             }
           }
+
+          // Only run check after adding new jobs for discovery - mogery
+          if (job.data.isCrawlSourceScrape && crawler.filterLinks([doc.metadata.url ?? doc.metadata.sourceURL!], 1, sc.crawlerOptions?.maxDepth ?? 10).length === 0) {
+            throw new Error("Source URL is not allowed by includePaths/excludePaths rules")
+          }
         }
       }
 
@@ -1118,16 +1228,38 @@ async function processJob(job: Job & { id: string }, token: string) {
         creditsToBeBilled = 5;
       }
 
-      if (job.data.team_id !== process.env.BACKGROUND_INDEX_TEAM_ID!) {
-        billTeam(job.data.team_id, undefined, creditsToBeBilled, logger).catch(
-          (error) => {
-            logger.error(
-              `Failed to bill team ${job.data.team_id} for ${creditsToBeBilled} credits`,
-              { error },
-            );
-            // Optionally, you could notify an admin or add to a retry queue here
-          },
-        );
+      if (job.data.team_id !== process.env.BACKGROUND_INDEX_TEAM_ID! && process.env.USE_DB_AUTHENTICATION === "true") {
+        try {
+          const billingJobId = uuidv4();
+          logger.debug(`Adding billing job to queue for team ${job.data.team_id}`, {
+            billingJobId,
+            credits: creditsToBeBilled,
+            is_extract: false,
+          });
+          
+          // Add directly to the billing queue - the billing worker will handle the rest
+          await getBillingQueue().add(
+            "bill_team",
+            {
+              team_id: job.data.team_id,
+              subscription_id: undefined,
+              credits: creditsToBeBilled,
+              is_extract: false,
+              timestamp: new Date().toISOString(),
+              originating_job_id: job.id
+            },
+            {
+              jobId: billingJobId,
+              priority: 10,
+            }
+          );
+        } catch (error) {
+          logger.error(
+            `Failed to add billing job to queue for team ${job.data.team_id} for ${creditsToBeBilled} credits`,
+            { error },
+          );
+          Sentry.captureException(error);
+        }
       }
     }
 

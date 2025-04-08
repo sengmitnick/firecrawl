@@ -95,7 +95,7 @@ curl -X POST https://api.firecrawl.dev/v1/crawl \
     -H 'Authorization: Bearer fc-YOUR_API_KEY' \
     -d '{
       "url": "https://docs.firecrawl.dev",
-      "limit": 100,
+      "limit": 10,
       "scrapeOptions": {
         "formats": ["markdown", "html"]
       }
@@ -281,7 +281,6 @@ curl -X POST https://api.firecrawl.dev/v1/extract \
         },
         "required": [
           "company_mission",
-          "supports_sso",
           "is_open_source",
           "is_in_yc"
         ]

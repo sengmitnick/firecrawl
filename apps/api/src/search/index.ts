@@ -1,9 +1,9 @@
 import { logger } from "../../src/lib/logger";
 import { SearchResult } from "../../src/lib/entities";
 import { googleSearch } from "./googlesearch";
-import { fireEngineMap } from "./fireEngine";
 import { searchapi_search } from "./searchapi";
 import { serper_search } from "./serper";
+import { searxng_search } from "./searxng";
 
 export async function search({
   query,
@@ -43,6 +43,16 @@ export async function search({
     }
     if (process.env.SEARCHAPI_API_KEY) {
       return await searchapi_search(query, {
+        num_results,
+        tbs,
+        filter,
+        lang,
+        country,
+        location,
+      });
+    }
+    if (process.env.SEARXNG_ENDPOINT) {
+      return await searxng_search(query, {
         num_results,
         tbs,
         filter,

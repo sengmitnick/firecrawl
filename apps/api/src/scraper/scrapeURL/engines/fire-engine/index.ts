@@ -133,11 +133,12 @@ async function performFireEngineScrape<
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  specialtyScrapeCheck(
+  await specialtyScrapeCheck(
     logger.child({
       method: "performFireEngineScrape/specialtyScrapeCheck",
     }),
     status.responseHeaders,
+    status,
   );
 
   const contentType = (Object.entries(status.responseHeaders ?? {}).find(
@@ -273,6 +274,7 @@ export async function scrapeURLWithFireEngineChromeCDP(
           actions: {
             screenshots: response.screenshots ?? [],
             scrapes: response.actionContent ?? [],
+            javascriptReturns: (response.actionResults ?? []).filter(x => x.type === "executeJavascript").map(x => JSON.parse((x.result as any as { return: string }).return)),
           },
         }
       : {}),

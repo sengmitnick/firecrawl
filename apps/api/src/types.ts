@@ -59,6 +59,7 @@ export interface RunWebScraperParams {
   priority?: number;
   is_scrape?: boolean;
   is_crawl?: boolean;
+  urlInvisibleInCurrentCrawl?: boolean;
 }
 
 export type RunWebScraperResult =
@@ -159,6 +160,7 @@ export enum NotificationType {
   AUTO_RECHARGE_SUCCESS = "autoRechargeSuccess",
   AUTO_RECHARGE_FAILED = "autoRechargeFailed",
   CONCURRENCY_LIMIT_REACHED = "concurrencyLimitReached",
+  AUTO_RECHARGE_FREQUENT = "autoRechargeFrequent",
 }
 
 export type ScrapeLog = {

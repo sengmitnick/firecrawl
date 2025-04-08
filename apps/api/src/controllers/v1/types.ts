@@ -20,7 +20,8 @@ export type Format =
   | "links"
   | "screenshot"
   | "screenshot@fullPage"
-  | "extract";
+  | "extract"
+  | "compare";
 
 export const url = z.preprocess(
   (x) => {
@@ -65,6 +66,7 @@ export const extractOptions = z
         "Based on the information on the page, extract all the information from the schema in JSON format. Try to extract all the fields even those that might not be marked as required.",
       ),
     prompt: z.string().max(10000).optional(),
+    temperature: z.number().optional(),
   })
   .strict(strictMessage);
 
@@ -113,6 +115,7 @@ export const actionsSchema = z
       z.object({
         type: z.literal("click"),
         selector: z.string(),
+        all: z.boolean().default(false),
       }),
       z.object({
         type: z.literal("screenshot"),
@@ -163,6 +166,7 @@ const baseScrapeOptions = z
         "screenshot@fullPage",
         "extract",
         "json",
+        "compare",
       ])
       .array()
       .optional()
@@ -170,6 +174,10 @@ const baseScrapeOptions = z
       .refine(
         (x) => !(x.includes("screenshot") && x.includes("screenshot@fullPage")),
         "You may only specify either screenshot or screenshot@fullPage",
+      )
+      .refine(
+        (x) => !x.includes("compare") || x.includes("markdown"),
+        "The compare format requires the markdown format to be specified as well",
       ),
     headers: z.record(z.string(), z.string()).optional(),
     includeTags: z.string().array().optional(),
@@ -244,10 +252,11 @@ const extractRefine = (obj) => {
   const hasJsonFormat = obj.formats?.includes("json");
   const hasJsonOptions = obj.jsonOptions !== undefined;
   return (
-    (hasExtractFormat && hasExtractOptions) ||
-    (!hasExtractFormat && !hasExtractOptions) ||
-    (hasJsonFormat && hasJsonOptions) ||
-    (!hasJsonFormat && !hasJsonOptions)
+    (hasExtractFormat && hasExtractOptions)
+    || (!hasExtractFormat && !hasExtractOptions)
+  ) && (
+    (hasJsonFormat && hasJsonOptions)
+    || (!hasJsonFormat && !hasJsonOptions)
   );
 };
 const extractRefineOpts = {
@@ -261,7 +270,7 @@ const extractTransform = (obj) => {
       obj.extract ||
       obj.formats?.includes("json") ||
       obj.jsonOptions) &&
-    !obj.timeout
+    (obj.timeout === 30000)
   ) {
     obj = { ...obj, timeout: 60000 };
   }
@@ -312,7 +321,8 @@ export const extractV1Options = z
   .object({
     urls: url
       .array()
-      .max(10, "Maximum of 10 URLs allowed per request while in beta."),
+      .max(10, "Maximum of 10 URLs allowed per request while in beta.")
+      .optional(),
     prompt: z.string().max(10000).optional(),
     systemPrompt: z.string().max(10000).optional(),
     schema: z
@@ -352,6 +362,12 @@ export const extractV1Options = z
       .optional(),
   })
   .strict(strictMessage)
+  .refine(
+    (obj) => obj.urls || obj.prompt,
+    {
+      message: "Either 'urls' or 'prompt' must be provided.",
+    },
+  )
   .transform((obj) => ({
     ...obj,
     allowExternalLinks: obj.allowExternalLinks || obj.enableWebSearch,
@@ -438,6 +454,7 @@ const crawlerOptions = z
     includePaths: z.string().array().default([]),
     excludePaths: z.string().array().default([]),
     maxDepth: z.number().default(10), // default?
+    maxDiscoveryDepth: z.number().optional(),
     limit: z.number().default(10000), // default?
     allowBackwardLinks: z.boolean().default(false), // >> TODO: CHANGE THIS NAME???
     allowExternalLinks: z.boolean().default(false),
@@ -446,6 +463,7 @@ const crawlerOptions = z
     ignoreSitemap: z.boolean().default(false),
     deduplicateSimilarURLs: z.boolean().default(true),
     ignoreQueryParameters: z.boolean().default(false),
+    regexOnFullURL: z.boolean().default(false),
   })
   .strict(strictMessage);
 
@@ -499,8 +517,10 @@ export const mapRequestSchema = crawlerOptions
     search: z.string().optional(),
     ignoreSitemap: z.boolean().default(false),
     sitemapOnly: z.boolean().default(false),
-    limit: z.number().min(1).max(5000).default(5000),
+    limit: z.number().min(1).max(30000).default(5000),
     timeout: z.number().positive().finite().optional(),
+    useMock: z.string().optional(),
+    filterByPath: z.boolean().default(true),
   })
   .strict(strictMessage);
 
@@ -527,7 +547,16 @@ export type Document = {
   actions?: {
     screenshots?: string[];
     scrapes?: ScrapeActionContent[];
+    javascriptReturns?: {
+      type: string,
+      value: unknown
+    }[];
   };
+  compare?: {
+    previousScrapeAt: string | null;
+    changeStatus: "new" | "same" | "changed" | "removed";
+    visibility: "visible" | "hidden";
+  }
   metadata: {
     title?: string;
     description?: string;
@@ -788,10 +817,13 @@ export function toLegacyCrawlerOptions(x: CrawlerOptions) {
     ignoreSitemap: x.ignoreSitemap,
     deduplicateSimilarURLs: x.deduplicateSimilarURLs,
     ignoreQueryParameters: x.ignoreQueryParameters,
+    regexOnFullURL: x.regexOnFullURL,
+    maxDiscoveryDepth: x.maxDiscoveryDepth,
+    currentDiscoveryDepth: 0,
   };
 }
 
-export function fromLegacyCrawlerOptions(x: any): {
+export function fromLegacyCrawlerOptions(x: any, teamId: string): {
   crawlOptions: CrawlerOptions;
   internalOptions: InternalOptions;
 } {
@@ -808,9 +840,12 @@ export function fromLegacyCrawlerOptions(x: any): {
       ignoreSitemap: x.ignoreSitemap,
       deduplicateSimilarURLs: x.deduplicateSimilarURLs,
       ignoreQueryParameters: x.ignoreQueryParameters,
-    }),
+      regexOnFullURL: x.regexOnFullURL,
+      maxDiscoveryDepth: x.maxDiscoveryDepth,
+   }),
     internalOptions: {
       v0CrawlOnlyUrls: x.returnOnlyUrls,
+      teamId,
     },
   };
 }
@@ -824,6 +859,7 @@ export function fromLegacyScrapeOptions(
   pageOptions: PageOptions,
   extractorOptions: ExtractorOptions | undefined,
   timeout: number | undefined,
+  teamId: string,
 ): { scrapeOptions: ScrapeOptions; internalOptions: InternalOptions } {
   return {
     scrapeOptions: scrapeOptions.parse({
@@ -873,6 +909,7 @@ export function fromLegacyScrapeOptions(
     internalOptions: {
       atsv: pageOptions.atsv,
       v0DisableJsDom: pageOptions.disableJsDom,
+      teamId,
     },
     // TODO: fallback, fetchPageContent, replaceAllPathsWithAbsolutePaths, includeLinks
   };
@@ -883,13 +920,15 @@ export function fromLegacyCombo(
   extractorOptions: ExtractorOptions | undefined,
   timeout: number | undefined,
   crawlerOptions: any,
+  teamId: string,
 ): { scrapeOptions: ScrapeOptions; internalOptions: InternalOptions } {
   const { scrapeOptions, internalOptions: i1 } = fromLegacyScrapeOptions(
     pageOptions,
     extractorOptions,
     timeout,
+    teamId,
   );
-  const { internalOptions: i2 } = fromLegacyCrawlerOptions(crawlerOptions);
+  const { internalOptions: i2 } = fromLegacyCrawlerOptions(crawlerOptions, teamId);
   return { scrapeOptions, internalOptions: Object.assign(i1, i2) };
 }
 
@@ -991,7 +1030,7 @@ export const generateLLMsTextRequestSchema = z.object({
   maxUrls: z
     .number()
     .min(1)
-    .max(100)
+    .max(5000)
     .default(10)
     .describe("Maximum number of URLs to process"),
   showFullText: z

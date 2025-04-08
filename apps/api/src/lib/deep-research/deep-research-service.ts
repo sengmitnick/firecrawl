@@ -4,23 +4,29 @@ import { PlanType } from "../../types";
 import { searchAndScrapeSearchResult } from "../../controllers/v1/search";
 import { ResearchLLMService, ResearchStateManager } from "./research-manager";
 import { logJob } from "../../services/logging/log_job";
-import { updateExtract } from "../extract/extract-redis";
 import { billTeam } from "../../services/billing/credit_billing";
+import { ExtractOptions } from "../../controllers/v1/types";
 
 interface DeepResearchServiceOptions {
   researchId: string;
   teamId: string;
   plan: string;
-  topic: string;
+  query: string;
   maxDepth: number;
+  maxUrls: number;
   timeLimit: number;
+  analysisPrompt: string;
+  systemPrompt: string;
+  formats: string[];
+  jsonOptions: ExtractOptions;
   subId?: string;
 }
 
 export async function performDeepResearch(options: DeepResearchServiceOptions) {
-  const { researchId, teamId, plan, timeLimit, subId } = options;
+  const { researchId, teamId, plan, timeLimit, subId, maxUrls } = options;
   const startTime = Date.now();
-  let currentTopic = options.topic;
+  let currentTopic = options.query;
+  let urlsAnalyzed = 0;
 
   const logger = _logger.child({
     module: "deep-research",
@@ -36,12 +42,12 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     plan,
     options.maxDepth,
     logger,
-    options.topic,
+    options.query,
   );
   const llmService = new ResearchLLMService(logger);
 
   try {
-    while (!state.hasReachedMaxDepth()) {
+    while (!state.hasReachedMaxDepth() && urlsAnalyzed < maxUrls) {
       logger.debug("[Deep Research] Current depth:", state.getCurrentDepth());
       const timeElapsed = Date.now() - startTime;
       if (timeElapsed >= timeLimit * 1000) {
@@ -52,13 +58,13 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       await state.incrementDepth();
 
       // Search phase
-      await state.addActivity({
+      await state.addActivity([{
         type: "search",
         status: "processing",
-        message: `Generating search queries for "${currentTopic}"`,
+        message: `Generating deeper search queries for "${currentTopic}"`,
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
-      });
+      }]);
 
       const nextSearchTopic = state.getNextSearchTopic();
       logger.debug("[Deep Research] Next search topic:", { nextSearchTopic });
@@ -72,29 +78,29 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
 
       logger.debug("[Deep Research] Generated search queries:", { searchQueries });
 
-      await state.addActivity({
+      await state.addActivity([{
         type: "search",
         status: "processing",
         message: `Starting ${searchQueries.length} parallel searches for "${currentTopic}"`,
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
-      });
+      }]);
+      await state.addActivity(searchQueries.map(searchQuery => ({
+        type: "search",
+        status: "processing", 
+        message: `Searching for "${searchQuery.query}" - Goal: ${searchQuery.researchGoal}`,
+        timestamp: new Date().toISOString(),
+        depth: state.getCurrentDepth(),
+      })))
 
       // Run all searches in parallel
       const searchPromises = searchQueries.map(async (searchQuery) => {
-        await state.addActivity({
-          type: "search",
-          status: "processing",
-          message: `Searching for "${searchQuery.query}" - Goal: ${searchQuery.researchGoal}`,
-          timestamp: new Date().toISOString(),
-          depth: state.getCurrentDepth(),
-        });
 
         const response = await searchAndScrapeSearchResult(searchQuery.query, {
           teamId: options.teamId,
           plan: options.plan as PlanType,
           origin: "deep-research",
-          timeout: 15000,
+          timeout: 10000,
           scrapeOptions: {
             formats: ["markdown"],
             onlyMainContent: true,
@@ -124,25 +130,33 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
           "[Deep Research] No results found for topic:",
           { currentTopic },
         );
-        await state.addActivity({
+        await state.addActivity([{
           type: "search",
           status: "error",
           message: `No results found for any queries about "${currentTopic}"`,
           timestamp: new Date().toISOString(),
           depth: state.getCurrentDepth(),
-        });
+        }]);
         continue;
       }
 
       // Filter out already seen URLs and track new ones
-      const newSearchResults = searchResults.filter((result) => {
+      const newSearchResults = searchResults.filter(async (result) => {
         if (!result.url || state.hasSeenUrl(result.url)) {
           return false;
         }
         state.addSeenUrl(result.url);
+        
+        urlsAnalyzed++;
         return true;
       });
 
+      await state.addSources(newSearchResults.map((result) => ({
+        url: result.url ?? "",
+        title: result.title ?? "",
+        description: result.description ?? "",
+        icon: result.metadata?.favicon ?? "",
+      })));
       logger.debug(
         "[Deep Research] New unique results count:",
         { length: newSearchResults.length },
@@ -153,23 +167,23 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
           "[Deep Research] No new unique results found for topic:",
           { currentTopic },
         );
-        await state.addActivity({
+        await state.addActivity([{
           type: "search",
           status: "error",
           message: `Found ${searchResults.length} results but all URLs were already processed for "${currentTopic}"`,
           timestamp: new Date().toISOString(),
           depth: state.getCurrentDepth(),
-        });
+        }]);
         continue;
       }
 
-      await state.addActivity({
+      await state.addActivity([{
         type: "search",
         status: "complete",
         message: `Found ${newSearchResults.length} new relevant results across ${searchQueries.length} parallel queries`,
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
-      });
+      }]);
 
       await state.addFindings(
         newSearchResults.map((result) => ({
@@ -179,13 +193,13 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       );
 
       // Analysis phase
-      await state.addActivity({
+      await state.addActivity([{
         type: "analyze",
         status: "processing",
-        message: "Analyzing findings",
+        message: "Analyzing findings and planning next steps",
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
-      });
+      }]);
 
       const timeRemaining = timeLimit * 1000 - (Date.now() - startTime);
       logger.debug("[Deep Research] Time remaining (ms):", { timeRemaining });
@@ -194,17 +208,18 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
         state.getFindings(),
         currentTopic,
         timeRemaining,
+        options.systemPrompt ?? "",
       );
 
       if (!analysis) {
         logger.debug("[Deep Research] Analysis failed");
-        await state.addActivity({
+        await state.addActivity([{
           type: "analyze",
           status: "error",
           message: "Failed to analyze findings",
           timestamp: new Date().toISOString(),
           depth: state.getCurrentDepth(),
-        });
+        }]);
 
         state.incrementFailedAttempts();
         if (state.hasReachedMaxFailedAttempts()) {
@@ -222,13 +237,13 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
 
       state.setNextSearchTopic(analysis.nextSearchTopic || "");
 
-      await state.addActivity({
+      await state.addActivity([{
         type: "analyze",
         status: "complete",
         message: "Analyzed findings",
         timestamp: new Date().toISOString(),
         depth: state.getCurrentDepth(),
-      });
+      }]);
 
       if (!analysis.shouldContinue || analysis.gaps.length === 0) {
         logger.debug("[Deep Research] No more gaps to research, ending search");
@@ -241,27 +256,42 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
 
     // Final synthesis
     logger.debug("[Deep Research] Starting final synthesis");
-    await state.addActivity({
+    await state.addActivity([{
       type: "synthesis",
       status: "processing",
       message: "Preparing final analysis",
       timestamp: new Date().toISOString(),
       depth: state.getCurrentDepth(),
-    });
+    }]);
 
-    const finalAnalysis = await llmService.generateFinalAnalysis(
-      options.topic,
-      state.getFindings(),
-      state.getSummaries(),
-    );
+    let finalAnalysis = "";
+    let finalAnalysisJson = null;
+    if(options.formats.includes('json')) {
+      finalAnalysisJson = await llmService.generateFinalAnalysis(
+        options.query,
+        state.getFindings(),
+        state.getSummaries(),
+        options.analysisPrompt,
+        options.formats,
+        options.jsonOptions,
+      );
+    }
+    if(options.formats.includes('markdown')) {
+      finalAnalysis = await llmService.generateFinalAnalysis(
+        options.query,
+        state.getFindings(),
+        state.getSummaries(),
+        options.analysisPrompt,
+      );
+    }
 
-    await state.addActivity({
+    await state.addActivity([{
       type: "synthesis",
       status: "complete",
       message: "Research completed",
       timestamp: new Date().toISOString(),
       depth: state.getCurrentDepth(),
-    });
+    }]);
 
     const progress = state.getProgress();
     logger.debug("[Deep Research] Research completed successfully");
@@ -272,26 +302,26 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       success: true,
       message: "Research completed",
       num_docs: 1,
-      docs: [{ finalAnalysis: finalAnalysis }],
+      docs: [{ finalAnalysis: finalAnalysis, sources: state.getSources(), json: finalAnalysisJson }],
       time_taken: (Date.now() - startTime) / 1000,
       team_id: teamId,
       mode: "deep-research",
-      url: options.topic,
+      url: options.query,
       scrapeOptions: options,
       origin: "api",
       num_tokens: 0,
       tokens_billed: 0,
-      sources: {},
     });
     await updateDeepResearch(researchId, {
       status: "completed",
       finalAnalysis: finalAnalysis,
+      json: finalAnalysisJson,
     });
-    // Bill team for usage
-    billTeam(teamId, subId, state.getFindings().length, logger).catch(
+    // Bill team for usage based on URLs analyzed
+    billTeam(teamId, subId, Math.min(urlsAnalyzed, options.maxUrls), logger).catch(
       (error) => {
         logger.error(
-          `Failed to bill team ${teamId} for ${state.getFindings().length} findings`, { teamId, count: state.getFindings().length, error },
+          `Failed to bill team ${teamId} for ${urlsAnalyzed} URLs analyzed`, { teamId, count: urlsAnalyzed, error },
         );
       },
     );
@@ -299,6 +329,8 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
       success: true,
       data: {
         finalAnalysis: finalAnalysis,
+        sources: state.getSources(),
+        json: finalAnalysisJson,
       },
     };
   } catch (error: any) {

@@ -1,4 +1,3 @@
-import OpenAI from "openai";
 import { encoding_for_model } from "@dqbd/tiktoken";
 import { TiktokenModel } from "@dqbd/tiktoken";
 import {
@@ -10,6 +9,10 @@ import { Logger } from "winston";
 import { EngineResultsTracker, Meta } from "..";
 import { logger } from "../../../lib/logger";
 import { modelPrices } from "../../../lib/extract/usage/model-prices";
+import { generateObject, generateText, LanguageModel } from 'ai';
+import { jsonSchema } from 'ai';
+import { getModel } from "../../../lib/generic-ai";
+import { z } from "zod";
 
 // Get max tokens from model prices
 const getModelLimits = (model: string) => {
@@ -71,9 +74,9 @@ function normalizeSchema(x: any): any {
     return {
       ...x,
       properties: Object.fromEntries(
-        Object.entries(x.properties).map(([k, v]) => [k, normalizeSchema(v)]),
+        Object.entries(x.properties || {}).map(([k, v]) => [k, normalizeSchema(v)]),
       ),
-      required: Object.keys(x.properties),
+      required: Object.keys(x.properties || {}),
       additionalProperties: false,
     };
   } else if (x && x.type === "array") {
@@ -86,47 +89,83 @@ function normalizeSchema(x: any): any {
   }
 }
 
-export function truncateText(text: string, maxTokens: number): string {
-  const modifier = 3; // Estimate: 1 token ≈ 3-4 characters for safety
+
+
+interface TrimResult {
+  text: string;
+  numTokens: number;
+  warning?: string;
+}
+
+export function trimToTokenLimit(text: string, maxTokens: number, modelId: string="gpt-4o", previousWarning?: string): TrimResult {
   try {
-    const encoder = encoding_for_model("gpt-4o");
-    // Continuously trim the text until its token count is within the limit.
-    while (true) {
+    const encoder = encoding_for_model(modelId as TiktokenModel);
+    try {
       const tokens = encoder.encode(text);
-      if (tokens.length <= maxTokens) {
-        return text;
+      const numTokens = tokens.length;
+      
+      if (numTokens <= maxTokens) {
+        return { text, numTokens };
       }
-      // Calculate a new length using a more conservative approach
-      // Instead of scaling the entire text, we'll remove a smaller portion
-      const ratio = maxTokens / tokens.length;
-      const newLength = Math.max(
-        Math.ceil(text.length * ratio),
-        Math.floor(text.length * 0.8)  // Never remove more than 20% at once
-      );
-      if (newLength <= 0) {
-        return "";
+
+      const modifier = 3;
+      // Start with 3 chars per token estimation
+      let currentText = text.slice(0, Math.floor(maxTokens * modifier) - 1);
+      
+      // Keep trimming until we're under the token limit
+      while (true) {
+        const currentTokens = encoder.encode(currentText);
+        if (currentTokens.length <= maxTokens) {
+          const warning = `The extraction content would have used more tokens (${numTokens}) than the maximum we allow (${maxTokens}). -- the input has been automatically trimmed.`;
+          return {
+            text: currentText,
+            numTokens: currentTokens.length,
+            warning: previousWarning ? `${warning} ${previousWarning}` : warning
+          };
+        }
+        const overflow = currentTokens.length * modifier - maxTokens - 1;
+        // If still over limit, remove another chunk
+        currentText = currentText.slice(0, Math.floor(currentText.length - overflow));
       }
-      text = text.slice(0, newLength);
+
+    } catch (e) {
+      throw e;
+    } finally {
+      encoder.free();
     }
   } catch (error) {
-    // Fallback using character-based estimation.
-    if (text.length <= maxTokens * modifier) {
-      return text;
-    }
-    return text.slice(0, maxTokens * modifier);
+    // Fallback to a more conservative character-based approach
+    const estimatedCharsPerToken = 2.8;
+    const safeLength = maxTokens * estimatedCharsPerToken;
+    const trimmedText = text.slice(0, Math.floor(safeLength));
+    
+    const warning = `Failed to derive number of LLM tokens the extraction might use -- the input has been automatically trimmed to the maximum number of tokens (${maxTokens}) we support.`;
+    
+    return {
+      text: trimmedText,
+      numTokens: maxTokens, // We assume we hit the max in this fallback case
+      warning: previousWarning ? `${warning} ${previousWarning}` : warning
+    };
   }
 }
 
-
-export async function generateOpenAICompletions(
-  logger: Logger,
-  options: ExtractOptions,
-  markdown?: string,
-  previousWarning?: string,
-  isExtractEndpoint?: boolean,
-  model: TiktokenModel = (process.env.MODEL_NAME as TiktokenModel) ??
-    "gpt-4o-mini",
-): Promise<{
+export async function generateCompletions({
+  logger,
+  options,
+  markdown,
+  previousWarning,
+  isExtractEndpoint,
+  model = getModel("gpt-4o-mini"),
+  mode = "object",
+}: {
+  model?: LanguageModel; 
+  logger: Logger;
+  options: ExtractOptions;
+  markdown?: string;
+  previousWarning?: string;
+  isExtractEndpoint?: boolean;
+  mode?: "object" | "no-object";
+}): Promise<{
   extract: any;
   numTokens: number;
   warning: string | undefined;
@@ -136,168 +175,165 @@ export async function generateOpenAICompletions(
   let extract: any;
   let warning: string | undefined;
 
-  const openai = new OpenAI();
-
   if (markdown === undefined) {
     throw new Error("document.markdown is undefined -- this is unexpected");
   }
 
-  const { maxInputTokens, maxOutputTokens } = getModelLimits(model);
-
-  // Ratio of 4 was way too high, now 3.5.
-  const modifier = 3.5; // tokens to characters ratio
+  const { maxInputTokens, maxOutputTokens } = getModelLimits(model.modelId);
   // Calculate 80% of max input tokens (for content)
   const maxTokensSafe = Math.floor(maxInputTokens * 0.8);
 
-  // count number of tokens
-  let numTokens = 0;
-  const encoder = encoding_for_model(model as TiktokenModel);
+  // Use the new trimming function
+  const { text: trimmedMarkdown, numTokens, warning: trimWarning } = trimToTokenLimit(
+    markdown,
+    maxTokensSafe,
+    model.modelId,
+    previousWarning
+  );
+
+  markdown = trimmedMarkdown;
+  warning = trimWarning;
+
   try {
-    // Encode the message into tokens
-    const tokens = encoder.encode(markdown);
+    const prompt = options.prompt !== undefined
+      ? `Transform the following content into structured JSON output based on the provided schema and this user request: ${options.prompt}. If schema is provided, strictly follow it.\n\n${markdown}`
+      : `Transform the following content into structured JSON output based on the provided schema if any.\n\n${markdown}`;
 
-    // Return the number of tokens
-    numTokens = tokens.length;
-  } catch (error) {
-    logger.warn("Calculating num tokens of string failed", { error, markdown });
-
-    markdown = markdown.slice(0, maxTokensSafe * modifier);
-
-    let w =
-      "Failed to derive number of LLM tokens the extraction might use -- the input has been automatically trimmed to the maximum number of tokens (" +
-      maxTokensSafe +
-      ") we support.";
-    warning = previousWarning === undefined ? w : w + " " + previousWarning;
-  } finally {
-    // Free the encoder resources after use
-    encoder.free();
-  }
-
-  if (numTokens > maxTokensSafe) {
-    // trim the document to the maximum number of tokens, tokens != characters
-    markdown = markdown.slice(0, maxTokensSafe * modifier);
-
-    const w =
-      "The extraction content would have used more tokens (" +
-      numTokens +
-      ") than the maximum we allow (" +
-      maxTokensSafe +
-      "). -- the input has been automatically trimmed.";
-    warning = previousWarning === undefined ? w : w + " " + previousWarning;
-  }
-
-  let schema = options.schema;
-  if (schema) {
-    schema = removeDefaultProperty(schema);
-  }
-
-  if (schema && schema.type === "array") {
-    schema = {
-      type: "object",
-      properties: {
-        items: options.schema,
-      },
-      required: ["items"],
-      additionalProperties: false,
-    };
-  } else if (schema && typeof schema === "object" && !schema.type) {
-    schema = {
-      type: "object",
-      properties: Object.fromEntries(
-        Object.entries(schema).map(([key, value]) => {
-          return [key, removeDefaultProperty(value)];
-        }),
-      ),
-      required: Object.keys(schema),
-      additionalProperties: false,
-    };
-  }
-
-  schema = normalizeSchema(schema);
-
-  const jsonCompletion = await openai.beta.chat.completions.parse({
-    model,
-    temperature: 0,
-    messages: [
-      {
-        role: "system",
-        content: options.systemPrompt,
-      },
-      {
-        role: "user",
-        content: [{ type: "text", text: markdown }],
-      },
-      {
-        role: "user",
-        content:
-          options.prompt !== undefined
-            ? `Transform the above content into structured JSON output based on the provided schema if any and the following user request: ${options.prompt}. If schema is provided, strictly follow it.`
-            : "Transform the above content into structured JSON output based on the provided schema if any.",
-      },
-    ],
-    response_format: options.schema
-      ? {
-          type: "json_schema",
-          json_schema: {
-            name: "schema",
-            schema: schema,
-            strict: true,
-          },
-        }
-      : { type: "json_object" },
-  });
-
-  if (jsonCompletion.choices[0].message.refusal !== null) {
-    throw new LLMRefusalError(jsonCompletion.choices[0].message.refusal);
-  }
-
-  extract = jsonCompletion.choices[0].message.parsed;
-
-  if (extract === null && jsonCompletion.choices[0].message.content !== null) {
-    try {
-      if (!isExtractEndpoint) {
-        extract = JSON.parse(jsonCompletion.choices[0].message.content);
-      } else {
-        const extractData = JSON.parse(
-          jsonCompletion.choices[0].message.content,
-        );
-        extract = options.schema ? extractData.data.extract : extractData;
-      }
-    } catch (e) {
-      logger.error("Failed to parse returned JSON, no schema specified.", {
-        error: e,
+    if (mode === "no-object") {
+      const result = await generateText({
+        model: model,
+        prompt: options.prompt + (markdown ? `\n\nData:${markdown}` : ""),
+        temperature: options.temperature ?? 0,
+        system: options.systemPrompt,
       });
-      throw new LLMRefusalError(
-        "Failed to parse returned JSON. Please specify a schema in the extract object.",
-      );
+
+      extract = result.text;
+      
+      return {
+        extract,
+        warning,
+        numTokens,
+        totalUsage: {
+          promptTokens: numTokens,
+          completionTokens: result.usage?.completionTokens ?? 0,
+          totalTokens: numTokens + (result.usage?.completionTokens ?? 0),
+        },
+        model: model.modelId,
+      };
     }
-  }
 
-  const promptTokens = jsonCompletion.usage?.prompt_tokens ?? 0;
-  const completionTokens = jsonCompletion.usage?.completion_tokens ?? 0;
+    let schema = options.schema;
+    // Normalize the bad json schema users write (mogery)
+    if (schema && !(schema instanceof z.ZodType)) {
+      // let schema = options.schema;
+      if (schema) {
+        schema = removeDefaultProperty(schema);
+      }
 
-  // If the users actually wants the items object, they can specify it as 'required' in the schema
-  // otherwise, we just return the items array
-  if (
-    options.schema &&
-    options.schema.type === "array" &&
-    !schema?.required?.includes("items")
-  ) {
-    extract = extract?.items;
+      if (schema && schema.type === "array") {
+        schema = {
+          type: "object",
+          properties: {
+            items: options.schema,
+          },
+          required: ["items"],
+          additionalProperties: false,
+        };
+      } else if (schema && typeof schema === "object" && !schema.type) {
+        schema = {
+          type: "object",
+          properties: Object.fromEntries(
+            Object.entries(schema).map(([key, value]) => {
+              return [key, removeDefaultProperty(value)];
+            }),
+          ),
+          required: Object.keys(schema),
+          additionalProperties: false,
+        };
+      }
+
+      schema = normalizeSchema(schema);
+    }
+
+    const repairConfig = {
+      experimental_repairText: async ({ text, error }) => {
+        // AI may output a markdown JSON code block. Remove it - mogery
+        if (typeof text === "string" && text.trim().startsWith("```")) {
+          if (text.trim().startsWith("```json")) {
+            text = text.trim().slice("```json".length).trim();
+          } else {
+            text = text.trim().slice("```".length).trim();
+          }
+
+          if (text.trim().endsWith("```")) {
+            text = text.trim().slice(0, -"```".length).trim();
+          }
+
+          // If this fixes the JSON, just return it. If not, continue - mogery
+          try {
+            JSON.parse(text);
+            return text;
+          } catch (_) {}
+        }
+
+        const { text: fixedText } = await generateText({
+          model: model,
+          prompt: `Fix this JSON that had the following error: ${error}\n\nOriginal text:\n${text}\n\nReturn only the fixed JSON, no explanation.`,
+          system: "You are a JSON repair expert. Your only job is to fix malformed JSON and return valid JSON that matches the original structure and intent as closely as possible. Do not include any explanation or commentary - only return the fixed JSON. Do not return it in a Markdown code block, just plain JSON."
+        });
+        return fixedText;
+      }
+    };
+
+    const generateObjectConfig = {
+      model: model,
+      prompt: prompt,
+      temperature: options.temperature ?? 0,
+      system: options.systemPrompt,
+      ...(schema && { schema: schema instanceof z.ZodType ? schema : jsonSchema(schema) }),
+      ...(!schema && { output: 'no-schema' as const }),
+      ...repairConfig,
+      ...(!schema && {
+        onError: (error: Error) => {
+          console.error(error);
+        }
+      })
+    } satisfies Parameters<typeof generateObject>[0];
+
+    const result = await generateObject(generateObjectConfig);
+    extract = result.object;
+
+    // If the users actually wants the items object, they can specify it as 'required' in the schema
+    // otherwise, we just return the items array
+    if (
+      options.schema &&
+      options.schema.type === "array" &&
+      !schema?.required?.includes("items")
+    ) {
+      extract = extract?.items;
+    }
+
+    // Since generateObject doesn't provide token usage, we'll estimate it
+    const promptTokens = numTokens;
+    const completionTokens = result?.usage?.completionTokens ?? 0;
+
+    return {
+      extract,
+      warning,
+      numTokens,
+      totalUsage: {
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
+      },
+      model: model.modelId,
+    };
+  } catch (error) {
+    if (error.message?.includes('refused')) {
+      throw new LLMRefusalError(error.message);
+    }
+    throw error;
   }
-  // num tokens (just user prompt tokenized) | deprecated
-  // totalTokens = promptTokens + completionTokens
-  return {
-    extract,
-    warning,
-    numTokens,
-    totalUsage: {
-      promptTokens,
-      completionTokens,
-      totalTokens: promptTokens + completionTokens,
-    },
-    model,
-  };
 }
 
 export async function performLLMExtract(
@@ -306,14 +342,14 @@ export async function performLLMExtract(
 ): Promise<Document> {
   if (meta.options.formats.includes("extract")) {
     meta.internalOptions.abort?.throwIfAborted();
-    const { extract, warning } = await generateOpenAICompletions(
-      meta.logger.child({
-        method: "performLLMExtract/generateOpenAICompletions",
+    const { extract, warning } = await generateCompletions({
+      logger: meta.logger.child({
+        method: "performLLMExtract/generateCompletions",
       }),
-      meta.options.extract!,
-      document.markdown,
-      document.warning,
-    );
+      options: meta.options.extract!,
+      markdown: document.markdown,
+      previousWarning: document.warning
+    });
 
     if (meta.options.formats.includes("json")) {
       document.json = extract;
@@ -329,7 +365,37 @@ export async function performLLMExtract(
 export function removeDefaultProperty(schema: any): any {
   if (typeof schema !== "object" || schema === null) return schema;
 
-  const { default: _, ...rest } = schema;
+  const rest = { ...schema };
+  
+  // unsupported global keys
+  delete rest.default;
+
+  // unsupported object keys
+  delete rest.patternProperties;
+  delete rest.unevaluatedProperties;
+  delete rest.propertyNames;
+  delete rest.minProperties;
+  delete rest.maxProperties;
+
+  // unsupported string keys
+  delete rest.minLength;
+  delete rest.maxLength;
+  delete rest.pattern;
+  delete rest.format;
+
+  // unsupported number keys
+  delete rest.minimum;
+  delete rest.maximum;
+  delete rest.multipleOf;
+
+  // unsupported array keys
+  delete rest.unevaluatedItems;
+  delete rest.contains;
+  delete rest.minContains;
+  delete rest.maxContains;
+  delete rest.minItems;
+  delete rest.maxItems;
+  delete rest.uniqueItems;
 
   for (const key in rest) {
     if (Array.isArray(rest[key])) {
@@ -343,20 +409,20 @@ export function removeDefaultProperty(schema: any): any {
 }
 
 export async function generateSchemaFromPrompt(prompt: string): Promise<any> {
-  const openai = new OpenAI();
-
+  const model = getModel("gpt-4o");
   const temperatures = [0, 0.1, 0.3]; // Different temperatures to try
   let lastError: Error | null = null;
 
   for (const temp of temperatures) {
     try {
-      const result = await openai.beta.chat.completions.parse({
-        model: "gpt-4o",
-        temperature: temp,
-        messages: [
-          {
-            role: "system",
-            content: `You are a schema generator for a web scraping system. Generate a JSON schema based on the user's prompt.
+      const { extract } = await generateCompletions({
+        logger: logger.child({
+          method: "generateSchemaFromPrompt/generateCompletions",
+        }),
+        model: model,
+        options: {
+          mode: "llm",
+          systemPrompt: `You are a schema generator for a web scraping system. Generate a JSON schema based on the user's prompt.
 Consider:
 1. The type of data being requested
 2. Required fields vs optional fields
@@ -381,28 +447,14 @@ Optionals are not supported.
 DO NOT USE FORMATS.
 Keep it simple. Don't create too many properties, just the ones that are needed. Don't invent properties.
 Return a valid JSON schema object with properties that would capture the information requested in the prompt.`,
-          },
-          {
-            role: "user",
-            content: `Generate a JSON schema for extracting the following information: ${prompt}`,
-          },
-        ],
-        response_format: {
-          type: "json_object",
+          prompt: `Generate a JSON schema for extracting the following information: ${prompt}`,
+          temperature: temp 
         },
+        markdown: prompt
       });
 
-      if (result.choices[0].message.refusal !== null) {
-        throw new Error("LLM refused to generate schema");
-      }
+      return extract;
 
-      let schema;
-      try {
-        schema = JSON.parse(result.choices[0].message.content ?? "");
-        return schema;
-      } catch (e) {
-        throw new Error("Failed to parse schema JSON from LLM response");
-      }
     } catch (error) {
       lastError = error as Error;
       logger.warn(`Failed attempt with temperature ${temp}: ${error.message}`);

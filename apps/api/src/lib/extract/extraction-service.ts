@@ -6,10 +6,10 @@ import {
 } from "../../controllers/v1/types";
 import { PlanType } from "../../types";
 import { logger as _logger } from "../logger";
-import { processUrl } from "./url-processor";
+import { generateBasicCompletion, processUrl } from "./url-processor";
 import { scrapeDocument } from "./document-scraper";
 import {
-  generateOpenAICompletions,
+  generateCompletions,
   generateSchemaFromPrompt,
 } from "../../scraper/scrapeURL/transformers/llmExtract";
 import { billTeam } from "../../services/billing/credit_billing";
@@ -38,6 +38,8 @@ import { singleAnswerCompletion } from "./completions/singleAnswer";
 import { SourceTracker } from "./helpers/source-tracker";
 import { getCachedDocs, saveCachedDocs } from "./helpers/cached-docs";
 import { normalizeUrl } from "../canonical-url";
+import { search } from "../../search";
+import { buildRephraseToSerpPrompt } from "./build-prompts";
 
 interface ExtractServiceOptions {
   request: ExtractRequest;
@@ -84,16 +86,43 @@ export async function performExtraction(
   let totalUrlsScraped = 0;
   let sources: Record<string, string[]> = {};
 
+
   const logger = _logger.child({
     module: "extract",
     method: "performExtraction",
     extractId,
   });
 
-  if (request.__experimental_cacheMode == "load" && request.__experimental_cacheKey) {
+  // If no URLs are provided, generate URLs from the prompt
+  if ((!request.urls || request.urls.length === 0) && request.prompt) {
+    logger.debug("Generating URLs from prompt...", {
+      prompt: request.prompt,
+    });
+    const rephrasedPrompt = await generateBasicCompletion(buildRephraseToSerpPrompt(request.prompt));
+    const searchResults = await search({
+      query:  rephrasedPrompt.replace('"', "").replace("'", ""),
+      num_results: 10,
+    });
+
+    request.urls = searchResults.map(result => result.url) as string[];
+  }
+  if (request.urls && request.urls.length === 0) {
+    logger.error("No search results found", {
+      query: request.prompt,
+    });
+    return {
+      success: false,
+      error: "No search results found",
+      extractId,
+    };
+  }
+
+  const urls = request.urls || ([] as string[]);
+
+  if (request.__experimental_cacheMode == "load" && request.__experimental_cacheKey && urls) {
     logger.debug("Loading cached docs...");
     try {
-      const cache = await getCachedDocs(request.urls, request.__experimental_cacheKey);
+      const cache = await getCachedDocs(urls, request.__experimental_cacheKey);
       for (const doc of cache) {
         if (doc.metadata.url) {
           docsMap.set(normalizeUrl(doc.metadata.url), doc);
@@ -122,11 +151,10 @@ export async function performExtraction(
   let startMap = Date.now();
   let aggMapLinks: string[] = [];
   logger.debug("Processing URLs...", {
-    urlCount: request.urls.length,
+    urlCount: request.urls?.length || 0,
   });
   
-  // Process URLs
-  const urlPromises = request.urls.map((url) =>
+  const urlPromises = urls.map((url) =>
     processUrl(
       {
         url,
@@ -410,7 +438,7 @@ export async function performExtraction(
           const multiEntityCompletion = (await Promise.race([
             completionPromise,
             timeoutPromise,
-          ])) as Awaited<ReturnType<typeof generateOpenAICompletions>>;
+          ])) as Awaited<ReturnType<typeof generateCompletions>>;
 
           // Track multi-entity extraction tokens
           if (multiEntityCompletion) {
@@ -680,7 +708,7 @@ export async function performExtraction(
   // }
   // // Deduplicate and validate final result against schema
   // if (reqSchema && finalResult && finalResult.length <= extractConfig.DEDUPLICATION.MAX_TOKENS) {
-  //   const schemaValidation = await generateOpenAICompletions(
+  //   const schemaValidation = await generateCompletions(
   //     logger.child({ method: "extractService/validateAndDeduplicate" }),
   //     {
   //       mode: "llm",
@@ -746,7 +774,7 @@ export async function performExtraction(
     time_taken: (new Date().getTime() - Date.now()) / 1000,
     team_id: teamId,
     mode: "extract",
-    url: request.urls.join(", "),
+    url: request.urls?.join(", ") || "",
     scrapeOptions: request,
     origin: request.origin ?? "api",
     num_tokens: totalTokensUsed,

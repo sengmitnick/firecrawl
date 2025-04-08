@@ -45,6 +45,7 @@ export type StoredDeepResearch = {
   activities: DeepResearchActivity[];
   summaries: string[];
   finalAnalysis?: string;
+  json?: any;
 };
 
 // TTL of 6 hours
@@ -88,6 +89,8 @@ export async function updateDeepResearch(
       ? [...(current.summaries || []), ...research.summaries]
       : current.summaries
   };
+
+  
 
   await redisConnection.set("deep-research:" + id, JSON.stringify(updatedResearch));
   await redisConnection.expire("deep-research:" + id, DEEP_RESEARCH_TTL);

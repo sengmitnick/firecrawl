@@ -33,6 +33,7 @@ import { generateLLMsTextController } from "../controllers/v1/generate-llmstxt";
 import { generateLLMsTextStatusController } from "../controllers/v1/generate-llmstxt-status";
 import { deepResearchController } from "../controllers/v1/deep-research";
 import { deepResearchStatusController } from "../controllers/v1/deep-research-status";
+import { tokenUsageController } from "../controllers/v1/token-usage";
 
 function checkCreditsMiddleware(
   minimum?: number,
@@ -51,7 +52,18 @@ function checkCreditsMiddleware(
       if (chunk) {
         req.acuc = chunk;
       }
+      req.account = { remainingCredits };
       if (!success) {
+        if (!minimum && req.body && (req.body as any).limit !== undefined && remainingCredits > 0) {
+          logger.warn("Adjusting limit to remaining credits", {
+            teamId: req.auth.team_id,
+            remainingCredits,
+            request: req.body,
+          });
+          (req.body as any).limit = remainingCredits;
+          return next();
+        }
+
         const currencyName = req.acuc.is_extract ? "tokens" : "credits"
         logger.error(
           `Insufficient ${currencyName}: ${JSON.stringify({ team_id: req.auth.team_id, minimum, remainingCredits })}`,
@@ -71,7 +83,6 @@ function checkCreditsMiddleware(
           });
         }
       }
-      req.account = { remainingCredits };
       next();
     })().catch((err) => next(err));
   };
@@ -292,4 +303,10 @@ v1Router.get(
   "/team/credit-usage",
   authMiddleware(RateLimiterMode.CrawlStatus),
   wrap(creditUsageController),
+);
+
+v1Router.get(
+  "/team/token-usage",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  wrap(tokenUsageController),
 );
