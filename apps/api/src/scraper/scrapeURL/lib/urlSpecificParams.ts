@@ -48,4 +48,8 @@ export const urlSpecificParams: Record<string, UrlSpecificParams> = {
     scrapeOptions: {},
     internalOptions: { forceEngine: "fire-engine;tlsclient" },
   },
+  "mp.weixin.qq.com": {
+    scrapeOptions: { waitFor: 3000 },
+    internalOptions: { forceEngine: "playwright" },
+  },
 };

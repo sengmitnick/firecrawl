@@ -1,0 +1,7 @@
+POST http://localhost:3002/v1/scrape
+Content-Type: application/json
+X-Disable-Cache: true
+
+{
+  "url": "https://mp.weixin.qq.com/s?__biz=MzkyODIxMjczMA==&mid=2247502419&idx=1&sn=120f53719910bcc2c633b2f831d7a011&t=1743871123455"
+}
