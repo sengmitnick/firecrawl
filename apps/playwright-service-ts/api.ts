@@ -165,6 +165,30 @@ const scrapePage = async (
   );
   const response = await page.goto(url, { waitUntil, timeout });
 
+  if (url.includes("mp.weixin.qq.com")) {
+    await page.addInitScript(`
+Object.defineProperty(window, 'wx', {  
+          value: {  
+              config: function(options) {  
+                  // 模拟 wx.config 的逻辑  
+                  console.log('Mock wx.config called with options:', options);  
+              },  
+              ready: function(callback) {  
+                  // 假设 ready 是立即执行的  
+                  callback();  
+              },  
+              error: function(callback) {  
+                  // 模拟错误处理的逻辑  
+              },  
+              // ... 其他需要模拟的 wx API  
+          },  
+          writable: false, // 防止被重写  
+          enumerable: true, // 使其可枚举  
+          configurable: false // 防止被删除或修改  
+      });
+`)
+  }
+
   if (waitAfterLoad > 0) {
     await page.waitForTimeout(waitAfterLoad);
   }
