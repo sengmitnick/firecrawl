@@ -5,3 +5,12 @@ X-Disable-Cache: true
 {
   "url": "https://mp.weixin.qq.com/s?__biz=MzkyODIxMjczMA==&mid=2247502419&idx=1&sn=120f53719910bcc2c633b2f831d7a011&t=1743871123455"
 }
+
+
+POST http://firecrawl.superai42.com/v1/scrape
+content-type: application/json
+
+{
+  "url": "https://mp.weixin.qq.com/s?__biz=MzU5MTk1NjI4Mg==&amp;mid=2247499981&amp;idx=2&amp;sn=2993ec48b4f92648dd1391bebda05291&amp;scene=21#wechat_redirect",
+  "formats": ["markdown", "html"]
+}
