@@ -69,9 +69,8 @@ const initializeBrowser = async () => {
     ],
   });
 
-  // const userAgent = new UserAgent().toString();
-  const userAgent =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/3.8.10(0x13080a10) XWEB/1227 Flue";
+  let userAgent = new UserAgent().toString();
+  userAgent = userAgent + " MicroMessenger/6.8.0(0x16080000)";
   const viewport = { width: 1280, height: 800 };
 
   const contextOptions: BrowserContextOptions = {
@@ -186,7 +185,7 @@ Object.defineProperty(window, 'wx', {
           enumerable: true, // 使其可枚举  
           configurable: false // 防止被删除或修改  
       });
-`)
+`);
   }
 
   if (waitAfterLoad > 0) {
