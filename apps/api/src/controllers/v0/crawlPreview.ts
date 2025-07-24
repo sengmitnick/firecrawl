@@ -30,8 +30,10 @@ export async function crawlPreviewController(req: Request, res: Response) {
     if (!auth.success) {
       return res.status(auth.status).json({ error: auth.error });
     }
-
-    const { plan } = auth;
+    
+    if (auth.chunk?.flags?.forceZDR) {
+      return res.status(400).json({ error: "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API." });
+    }
 
     let url = req.body.url;
     if (!url) {
@@ -45,7 +47,7 @@ export async function crawlPreviewController(req: Request, res: Response) {
         .json({ error: e.message ?? e });
     }
 
-    if (isUrlBlocked(url)) {
+    if (isUrlBlocked(url, auth.chunk?.flags ?? null)) {
       return res.status(403).json({
         error: BLOCKLISTED_URL_MESSAGE,
       });
@@ -108,14 +110,13 @@ export async function crawlPreviewController(req: Request, res: Response) {
       scrapeOptions,
       internalOptions,
       team_id,
-      plan,
       robots,
       createdAt: Date.now(),
     };
 
     await saveCrawl(id, sc);
 
-    const crawler = crawlToCrawler(id, sc);
+    const crawler = crawlToCrawler(id, sc, auth.chunk?.flags ?? null);
 
     await finishCrawlKickoff(id);
 
@@ -130,18 +131,18 @@ export async function crawlPreviewController(req: Request, res: Response) {
                 url,
                 mode: "single_urls",
                 team_id,
-                plan: plan!,
                 crawlerOptions,
                 scrapeOptions,
                 internalOptions,
                 origin: "website-preview",
                 crawl_id: id,
                 sitemapped: true,
+                zeroDataRetention: false, // not supported on v0
               },
               {},
               jobId,
             );
-            await addCrawlJob(id, jobId);
+            await addCrawlJob(id, jobId, logger);
           }
         });
 
@@ -153,17 +154,17 @@ export async function crawlPreviewController(req: Request, res: Response) {
           url,
           mode: "single_urls",
           team_id,
-          plan: plan!,
           crawlerOptions,
           scrapeOptions,
           internalOptions,
           origin: "website-preview",
           crawl_id: id,
+          zeroDataRetention: false, // not supported on v0
         },
         {},
         jobId,
       );
-      await addCrawlJob(id, jobId);
+      await addCrawlJob(id, jobId, logger);
     }
 
     res.json({ jobId: id });

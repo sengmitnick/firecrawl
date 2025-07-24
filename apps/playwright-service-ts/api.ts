@@ -200,17 +200,12 @@ Object.defineProperty(window, 'wx', {
     }
   }
 
-  let headers = null,
-    content = await page.content();
+  let headers = null, content = await page.content();
+  let ct: string | undefined = undefined;
   if (response) {
     headers = await response.allHeaders();
-    const ct = Object.entries(headers).find(
-      (x) => x[0].toLowerCase() === "content-type"
-    );
-    if (
-      ct &&
-      (ct[1].includes("application/json") || ct[1].includes("text/plain"))
-    ) {
+    ct = Object.entries(headers).find(x => x[0].toLowerCase() === "content-type")?.[1];
+    if (ct && (ct[1].includes("application/json") || ct[1].includes("text/plain"))) {
       content = (await response.body()).toString("utf8"); // TODO: determine real encoding
     }
   }
@@ -219,17 +214,31 @@ Object.defineProperty(window, 'wx', {
     content,
     status: response ? response.status() : null,
     headers,
+    contentType: ct,
   };
 };
 
-app.post("/scrape", async (req: Request, res: Response) => {
-  const {
-    url,
-    wait_after_load = 0,
-    timeout = 15000,
-    headers,
-    check_selector,
-  }: UrlModel = req.body;
+app.get('/health', async (req: Request, res: Response) => {
+  try {
+    if (!browser || !context) {
+      await initializeBrowser();
+    }
+    
+    const testPage = await context.newPage();
+    await testPage.close();
+    
+    res.status(200).json({ status: 'healthy' });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(503).json({ 
+      status: 'unhealthy', 
+      error: error instanceof Error ? error.message : 'Unknown error occurred' 
+    });
+  }
+});
+
+app.post('/scrape', async (req: Request, res: Response) => {
+  const { url, wait_after_load = 0, timeout = 15000, headers, check_selector }: UrlModel = req.body;
 
   console.log(`================= Scrape Request =================`);
   console.log(`URL: ${url}`);
@@ -313,7 +322,8 @@ app.post("/scrape", async (req: Request, res: Response) => {
   res.json({
     content: result.content,
     pageStatusCode: result.status,
-    ...(pageError && { pageError }),
+    contentType: result.contentType,
+    ...(pageError && { pageError })
   });
 });
 

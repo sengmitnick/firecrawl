@@ -1,7 +1,7 @@
 name: firecrawl
 
 x-common-service: &common-service
-  # NOTE: If you want to build the service locally,
+  # NOTE: If you don't want to build the service locally,
   # uncomment the build: statement and comment out the image: statement
   # image: ghcr.io/mendableai/firecrawl
   build: apps/api
@@ -33,7 +33,6 @@ x-common-env: &common-env
   SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
   SUPABASE_URL: ${SUPABASE_URL}
   SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
-  SCRAPING_BEE_API_KEY: ${SCRAPING_BEE_API_KEY}
   SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
   SERPER_API_KEY: ${SERPER_API_KEY}
   SEARCHAPI_API_KEY: ${SEARCHAPI_API_KEY}
@@ -47,6 +46,9 @@ x-common-env: &common-env
 
 services:
   playwright-service:
+    # NOTE: If you don't want to build the service locally,
+    # uncomment the build: statement and comment out the image: statement
+    # image: ghcr.io/mendableai/playwright-service:latest
     build: apps/playwright-service-ts
     image: ${DOCKER_REGISTRY}/firecrawl-prod/playwright-service:${IMAGE_TAG}
     environment:
@@ -66,6 +68,7 @@ services:
       HOST: "0.0.0.0"
       PORT: ${INTERNAL_PORT:-3002}
       FLY_PROCESS_GROUP: app
+      ENV: local
     depends_on:
       - redis
       - playwright-service
@@ -79,6 +82,7 @@ services:
     environment:
       <<: *common-env
       FLY_PROCESS_GROUP: worker
+      ENV: local
     depends_on:
       - redis
       - playwright-service

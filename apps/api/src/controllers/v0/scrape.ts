@@ -5,10 +5,10 @@ import {
   checkTeamCredits,
 } from "../../services/billing/credit_billing";
 import { authenticateUser } from "../auth";
-import { PlanType, RateLimiterMode } from "../../types";
-import { logJob } from "../../services/logging/log_job";
+import { RateLimiterMode } from "../../types";
 import {
   fromLegacyCombo,
+  TeamFlags,
   toLegacyDocument,
   url as urlSchema,
 } from "../v1/types";
@@ -21,7 +21,8 @@ import {
   defaultOrigin,
 } from "../../lib/default-values";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
-import { getScrapeQueue, redisConnection } from "../../services/queue-service";
+import { getScrapeQueue } from "../../services/queue-service";
+import { redisEvictConnection } from "../../../src/services/redis";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "../../lib/logger";
 import * as Sentry from "@sentry/node";
@@ -30,6 +31,7 @@ import { fromLegacyScrapeOptions } from "../v1/types";
 import { ZodError } from "zod";
 import { Document as V0Document } from "./../../lib/entities";
 import { BLOCKLISTED_URL_MESSAGE } from "../../lib/strings";
+import { getJobFromGCS } from "../../lib/gcs-jobs";
 
 export async function scrapeHelper(
   jobId: string,
@@ -39,7 +41,7 @@ export async function scrapeHelper(
   pageOptions: PageOptions,
   extractorOptions: ExtractorOptions,
   timeout: number,
-  plan?: PlanType,
+  flags: TeamFlags,
 ): Promise<{
   success: boolean;
   error?: string;
@@ -51,7 +53,7 @@ export async function scrapeHelper(
     return { success: false, error: "Url is required", returnCode: 400 };
   }
 
-  if (isUrlBlocked(url)) {
+  if (isUrlBlocked(url, flags)) {
     return {
       success: false,
       error: BLOCKLISTED_URL_MESSAGE,
@@ -59,7 +61,7 @@ export async function scrapeHelper(
     };
   }
 
-  const jobPriority = await getJobPriority({ plan, team_id, basePriority: 10 });
+  const jobPriority = await getJobPriority({ team_id, basePriority: 10 });
 
   const { scrapeOptions, internalOptions } = fromLegacyCombo(
     pageOptions,
@@ -69,6 +71,8 @@ export async function scrapeHelper(
     team_id,
   );
 
+  internalOptions.saveScrapeResultToGCS = process.env.GCS_FIRE_ENGINE_BUCKET_NAME ? true : false;
+
   await addScrapeJob(
     {
       url,
@@ -76,9 +80,11 @@ export async function scrapeHelper(
       team_id,
       scrapeOptions,
       internalOptions,
-      plan: plan!,
       origin: req.body.origin ?? defaultOrigin,
+      integration: req.body.integration,
       is_scrape: true,
+      startTime: Date.now(),
+      zeroDataRetention: false, // not supported on v0
     },
     {},
     jobId,
@@ -95,7 +101,7 @@ export async function scrapeHelper(
     },
     async (span) => {
       try {
-        doc = await waitForJob<Document>(jobId, timeout);
+        doc = await waitForJob(jobId, timeout);
       } catch (e) {
         if (
           e instanceof Error &&
@@ -180,9 +186,13 @@ export async function scrapeController(req: Request, res: Response) {
       return res.status(auth.status).json({ error: auth.error });
     }
 
-    const { team_id, plan, chunk } = auth;
+    const { team_id, chunk } = auth;
 
-    redisConnection.sadd("teams_using_v0", team_id)
+    if (chunk?.flags?.forceZDR) {
+      return res.status(400).json({ error: "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API." });
+    }
+
+    redisEvictConnection.sadd("teams_using_v0", team_id)
       .catch(error => logger.error("Failed to add team to teams_using_v0", { error, team_id }));
 
     const crawlerOptions = req.body.crawlerOptions ?? {};
@@ -240,7 +250,7 @@ export async function scrapeController(req: Request, res: Response) {
       pageOptions,
       extractorOptions,
       timeout,
-      plan,
+      chunk?.flags ?? null,
     );
     const endTime = new Date().getTime();
     const timeTakenInSeconds = (endTime - startTime) / 1000;
@@ -293,29 +303,6 @@ export async function scrapeController(req: Request, res: Response) {
         delete (doc as V0Document).markdown;
       }
     }
-
-    const { scrapeOptions } = fromLegacyScrapeOptions(
-      pageOptions,
-      extractorOptions,
-      timeout,
-      team_id,
-    );
-
-    logJob({
-      job_id: jobId,
-      success: result.success,
-      message: result.error,
-      num_docs: 1,
-      docs: [doc],
-      time_taken: timeTakenInSeconds,
-      team_id: team_id,
-      mode: "scrape",
-      url: req.body.url,
-      crawlerOptions: crawlerOptions,
-      scrapeOptions,
-      origin: origin,
-      num_tokens: numTokens,
-    });
 
     return res.status(result.returnCode).json(result);
   } catch (error) {

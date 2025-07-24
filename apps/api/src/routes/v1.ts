@@ -6,6 +6,7 @@ import { crawlStatusController } from "../controllers/v1/crawl-status";
 import { mapController } from "../controllers/v1/map";
 import {
   ErrorResponse,
+  isAgentExtractModelValid,
   RequestWithACUC,
   RequestWithAuth,
   RequestWithMaybeAuth,
@@ -34,11 +35,13 @@ import { generateLLMsTextStatusController } from "../controllers/v1/generate-llm
 import { deepResearchController } from "../controllers/v1/deep-research";
 import { deepResearchStatusController } from "../controllers/v1/deep-research-status";
 import { tokenUsageController } from "../controllers/v1/token-usage";
+import { ongoingCrawlsController } from "../controllers/v1/crawl-ongoing";
 
 function checkCreditsMiddleware(
-  minimum?: number,
+  _minimum?: number,
 ): (req: RequestWithAuth, res: Response, next: NextFunction) => void {
   return (req, res, next) => {
+    let minimum = _minimum;
     (async () => {
       if (!minimum && req.body) {
         minimum =
@@ -89,11 +92,20 @@ function checkCreditsMiddleware(
 }
 
 export function authMiddleware(
-  rateLimiterMode: RateLimiterMode,
+  rateLimiterMode: RateLimiterMode
 ): (req: RequestWithMaybeAuth, res: Response, next: NextFunction) => void {
   return (req, res, next) => {
     (async () => {
-      const auth = await authenticateUser(req, res, rateLimiterMode);
+      let currentRateLimiterMode = rateLimiterMode;
+      if (currentRateLimiterMode === RateLimiterMode.Extract && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
+        currentRateLimiterMode = RateLimiterMode.ExtractAgentPreview;
+      }
+
+      // if (currentRateLimiterMode === RateLimiterMode.Scrape && isAgentExtractModelValid((req.body as any)?.agent?.model)) {
+      //   currentRateLimiterMode = RateLimiterMode.ScrapeAgentPreview;
+      // }
+
+      const auth = await authenticateUser(req, res, currentRateLimiterMode);
 
       if (!auth.success) {
         if (!res.headersSent) {
@@ -105,9 +117,9 @@ export function authMiddleware(
         }
       }
 
-      const { team_id, plan, chunk } = auth;
+      const { team_id, chunk } = auth;
 
-      req.auth = { team_id, plan };
+      req.auth = { team_id };
       req.acuc = chunk ?? undefined;
       if (chunk) {
         req.account = { remainingCredits: chunk.remaining_credits };
@@ -138,8 +150,8 @@ function idempotencyMiddleware(
   })().catch((err) => next(err));
 }
 
-function blocklistMiddleware(req: Request, res: Response, next: NextFunction) {
-  if (typeof req.body.url === "string" && isUrlBlocked(req.body.url)) {
+function blocklistMiddleware(req: RequestWithACUC<any, any, any>, res: Response, next: NextFunction) {
+  if (typeof req.body.url === "string" && isUrlBlocked(req.body.url, req.acuc?.flags ?? null)) {
     if (!res.headersSent) {
       return res.status(403).json({
         success: false,
@@ -204,6 +216,19 @@ v1Router.post(
 );
 
 v1Router.get(
+  "/crawl/ongoing",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(ongoingCrawlsController),
+);
+
+// Public facing, same as ongoing
+v1Router.get(
+  "/crawl/active",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(ongoingCrawlsController),
+);
+
+v1Router.get(
   "/crawl/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
   wrap(crawlStatusController),
@@ -257,26 +282,27 @@ v1Router.get(
 
 v1Router.post(
   "/llmstxt",
-  authMiddleware(RateLimiterMode.Extract),
+  authMiddleware(RateLimiterMode.Scrape),
+  blocklistMiddleware,
   wrap(generateLLMsTextController),
 );
 
 v1Router.get(
   "/llmstxt/:jobId",
-  authMiddleware(RateLimiterMode.ExtractStatus),
+  authMiddleware(RateLimiterMode.CrawlStatus),
   wrap(generateLLMsTextStatusController),
 );
 
 v1Router.post(
   "/deep-research",
-  authMiddleware(RateLimiterMode.Extract),
+  authMiddleware(RateLimiterMode.Crawl),
   checkCreditsMiddleware(1),
   wrap(deepResearchController),
 );
 
 v1Router.get(
   "/deep-research/:jobId",
-  authMiddleware(RateLimiterMode.ExtractStatus),
+  authMiddleware(RateLimiterMode.CrawlStatus),
   wrap(deepResearchStatusController),
 );
 
@@ -284,6 +310,12 @@ v1Router.get(
 
 v1Router.delete(
   "/crawl/:jobId",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  crawlCancelController,
+);
+
+v1Router.delete(
+  "/batch/scrape/:jobId",
   authMiddleware(RateLimiterMode.CrawlStatus),
   crawlCancelController,
 );

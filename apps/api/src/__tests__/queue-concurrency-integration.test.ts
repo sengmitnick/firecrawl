@@ -6,8 +6,8 @@ import {
   takeConcurrencyLimitedJob,
   removeConcurrencyLimitActiveJob,
 } from "../lib/concurrency-limit";
-import { getConcurrencyLimitMax } from "../services/rate-limiter";
-import { WebScraperOptions, PlanType } from "../types";
+import { WebScraperOptions } from "../types";
+import { getACUCTeam } from "../controllers/auth";
 
 // Mock all the dependencies
 const mockAdd = jest.fn();
@@ -32,7 +32,6 @@ jest.mock("uuid", () => ({
 
 describe("Queue Concurrency Integration", () => {
   const mockTeamId = "test-team-id";
-  const mockPlan = "standard" as PlanType;
   const mockNow = Date.now();
 
   const defaultScrapeOptions = {
@@ -65,6 +64,8 @@ describe("Queue Concurrency Integration", () => {
     removeBase64Images: true,
     fastMode: false,
     blockAds: true,
+    maxAge: 0,
+    storeInCache: true,
   };
 
   beforeEach(() => {
@@ -77,9 +78,9 @@ describe("Queue Concurrency Integration", () => {
       url: "https://test.com",
       mode: "single_urls",
       team_id: mockTeamId,
-      plan: mockPlan,
       scrapeOptions: defaultScrapeOptions,
       crawlerOptions: null,
+      zeroDataRetention: false,
     };
 
     it("should add job directly to BullMQ when under concurrency limit", async () => {
@@ -104,8 +105,10 @@ describe("Queue Concurrency Integration", () => {
 
     it("should add job to concurrency queue when at concurrency limit", async () => {
       // Mock current active jobs to be at limit
-      const maxConcurrency = getConcurrencyLimitMax(mockPlan);
-      const activeJobs = Array(maxConcurrency).fill("active-job");
+      (getACUCTeam as jest.Mock).mockResolvedValue({
+        concurrency: 15,
+      } as any);
+      const activeJobs = Array(15).fill("active-job");
       (redisConnection.zrangebyscore as jest.Mock).mockResolvedValue(
         activeJobs,
       );
@@ -136,8 +139,8 @@ describe("Queue Concurrency Integration", () => {
             url: `https://test${i}.com`,
             mode: "single_urls",
             team_id: mockTeamId,
-            plan: mockPlan,
             scrapeOptions: defaultScrapeOptions,
+            zeroDataRetention: false,
           } as WebScraperOptions,
           opts: {
             jobId: `job-${i}`,
@@ -146,7 +149,10 @@ describe("Queue Concurrency Integration", () => {
         }));
 
     it("should handle batch jobs respecting concurrency limits", async () => {
-      const maxConcurrency = getConcurrencyLimitMax(mockPlan);
+      const maxConcurrency = 15;
+      (getACUCTeam as jest.Mock).mockResolvedValue({
+        concurrency: maxConcurrency,
+      } as any);
       const totalJobs = maxConcurrency + 5; // Some jobs should go to queue
       const mockJobs = createMockJobs(totalJobs);
 
@@ -180,7 +186,7 @@ describe("Queue Concurrency Integration", () => {
         id: "test-job",
         data: {
           team_id: mockTeamId,
-          plan: mockPlan,
+          zeroDataRetention: false,
         },
       };
 
@@ -218,7 +224,6 @@ describe("Queue Concurrency Integration", () => {
         id: "failing-job",
         data: {
           team_id: mockTeamId,
-          plan: mockPlan,
         },
       };
 

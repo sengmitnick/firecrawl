@@ -3,12 +3,14 @@ import * as Sentry from "@sentry/node";
 
 import { robustFetch } from "../../lib/fetch";
 import { MockState } from "../../lib/mock";
-import { fireEngineURL } from "./scrape";
+import { fireEngineStagingURL, fireEngineURL } from "./scrape";
 
 export async function fireEngineDelete(
   logger: Logger,
   jobId: string,
   mock: MockState | null,
+  abort?: AbortSignal,
+  production = true,
 ) {
   await Sentry.startSpan(
     {
@@ -19,7 +21,7 @@ export async function fireEngineDelete(
     },
     async (span) => {
       await robustFetch({
-        url: `${fireEngineURL}/scrape/${jobId}`,
+        url: `${production ? fireEngineURL : fireEngineStagingURL}/scrape/${jobId}`,
         method: "DELETE",
         headers: {
           ...(Sentry.isInitialized()
@@ -33,6 +35,7 @@ export async function fireEngineDelete(
         ignoreFailure: true,
         logger: logger.child({ method: "fireEngineDelete/robustFetch", jobId }),
         mock,
+        abort,
       });
     },
   );

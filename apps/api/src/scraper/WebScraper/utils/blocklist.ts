@@ -1,6 +1,7 @@
 import { configDotenv } from "dotenv";
 import crypto from "crypto";
 import { parse } from "tldts";
+import { TeamFlags } from "../../../controllers/v1/types";
 
 configDotenv();
 
@@ -91,8 +92,14 @@ const allowedKeywords = [
   "://ads.tiktok.com",
   "://tiktok.com/business",
   "://developers.facebook.com",
+  "://developers.meta.com",
   "://facebook.com/ads/library",
   "://www.facebook.com/ads/library",
+  "://meta.com/experiences",
+  "://www.meta.com/experiences",
+  "://creditcards.aa.com",
+  "://aa.org",
+  "://www.aa.org",
 ];
 
 export function decryptedBlocklist(list: string[]): string[] {
@@ -101,10 +108,15 @@ export function decryptedBlocklist(list: string[]): string[] {
     : [];
 }
 
-export function isUrlBlocked(url: string): boolean {
+export function isUrlBlocked(url: string, flags: TeamFlags): boolean {
   const lowerCaseUrl = url.trim().toLowerCase();
-  
-  const blockedlist = decryptedBlocklist(urlBlocklist);
+
+  let blockedlist = decryptedBlocklist(urlBlocklist);
+
+  if (flags?.unblockedDomains) {
+    blockedlist = blockedlist.filter((blocked) => !flags.unblockedDomains!.includes(blocked));
+  }
+
   const decryptedUrl =
     blockedlist.find((decrypted) => lowerCaseUrl === decrypted) ||
     lowerCaseUrl;

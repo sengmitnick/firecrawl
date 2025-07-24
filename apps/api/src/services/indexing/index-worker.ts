@@ -5,15 +5,17 @@ import { Job, Queue, Worker } from "bullmq";
 import { logger as _logger, logger } from "../../lib/logger";
 import {
   redisConnection,
-  indexQueueName,
-  getIndexQueue,
-  billingQueueName,
   getBillingQueue,
+  getPrecrawlQueue,
 } from "../queue-service";
-import { saveCrawlMap } from "./crawl-maps-index";
 import { processBillingBatch, queueBillingOperation, startBillingBatchProcessing } from "../billing/batch_billing";
 import systemMonitor from "../system-monitor";
 import { v4 as uuidv4 } from "uuid";
+import { index_supabase_service, processIndexInsertJobs, processIndexRFInsertJobs, processOMCEJobs } from "..";
+import { processWebhookInsertJobs } from "../webhook";
+import { scrapeOptions as scrapeOptionsSchema, crawlRequestSchema, toLegacyCrawlerOptions } from "../../controllers/v1/types";
+import { StoredCrawl, crawlToCrawler, saveCrawl } from "../../lib/crawl-redis";
+import { _addScrapeJobToBullMQ } from "../queue-jobs";
 
 const workerLockDuration = Number(process.env.WORKER_LOCK_DURATION) || 60000;
 const workerStalledCheckInterval =
@@ -30,39 +32,6 @@ const connectionMonitorInterval =
 const gotJobInterval = Number(process.env.CONNECTION_MONITOR_INTERVAL) || 20;
 
 const runningJobs: Set<string> = new Set();
-
-const processJobInternal = async (token: string, job: Job) => {
-  if (!job.id) {
-    throw new Error("Job has no ID");
-  }
-
-  const logger = _logger.child({
-    module: "index-worker",
-    method: "processJobInternal",
-    jobId: job.id,
-  });
-
-  const extendLockInterval = setInterval(async () => {
-    logger.info(`🔄 Worker extending lock on job ${job.id}`);
-    await job.extendLock(token, jobLockExtensionTime);
-  }, jobLockExtendInterval);
-
-  let err = null;
-  try {
-    const { originUrl, visitedUrls } = job.data;
-    await saveCrawlMap(originUrl, visitedUrls);
-    await job.moveToCompleted({ success: true }, token, false);
-  } catch (error) {
-    logger.error("Error processing index job", { error });
-    Sentry.captureException(error);
-    err = error;
-    await job.moveToFailed(error, token, false);
-  } finally {
-    clearInterval(extendLockInterval);
-  }
-
-  return err;
-};
 
 // Create a processor for billing jobs
 const processBillingJobInternal = async (token: string, job: Job) => {
@@ -115,6 +84,117 @@ const processBillingJobInternal = async (token: string, job: Job) => {
   }
 
   return err;
+};
+
+const processPrecrawlJobInternal = async (token: string, job: Job) => {
+  const logger = _logger.child({
+    module: "index-worker",
+    method: "processPrecrawlJobInternal",
+  });
+
+  const extendLockInterval = setInterval(async () => {
+    logger.info(`🔄 Worker extending lock on precrawl job ${job.id}`);
+    await job.extendLock(token, jobLockExtensionTime);
+  }, jobLockExtendInterval);
+
+  const teamId = process.env.PRECRAWL_TEAM_ID!;
+
+  try {
+    const budget = 100000;
+    const { data, error } = await index_supabase_service.rpc("precrawl_get_top_domains", {
+      i_newer_than: new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString(),
+    });
+
+    if (error) {
+      logger.error("Error getting top domains", { error });
+      throw error;
+    }
+
+    const total_hits = data.reduce((a, x) => a + x.count, 0);
+    for (const item of data) {
+      try {
+        const urlObj = new URL(item.example_url);
+        urlObj.pathname = "/";
+        urlObj.search = "";
+        urlObj.hash = "";
+
+        const url = urlObj.toString();
+
+        const limit = Math.round(item.count / total_hits * budget);
+
+        logger.info("Running pre-crawl", { url, limit, hits: item.count, budget });
+
+        const crawlerOptions = {
+          ...crawlRequestSchema.parse({ url, limit }),
+          url: undefined,
+          scrapeOptions: undefined,
+        };
+        const scrapeOptions = scrapeOptionsSchema.parse({});
+      
+        const sc: StoredCrawl = {
+          originUrl: url,
+          crawlerOptions: toLegacyCrawlerOptions(crawlerOptions),
+          scrapeOptions,
+          internalOptions: {
+            disableSmartWaitCache: true,
+            teamId,
+            saveScrapeResultToGCS: process.env.GCS_FIRE_ENGINE_BUCKET_NAME ? true : false,
+            zeroDataRetention: true,
+          }, // NOTE: smart wait disabled for crawls to ensure contentful scrape, speed does not matter
+          team_id: teamId,
+          createdAt: Date.now(),
+          maxConcurrency: undefined,
+          zeroDataRetention: false,
+        };
+
+        const crawlId = uuidv4();
+      
+        const crawler = crawlToCrawler(crawlId, sc, null);
+      
+        try {
+          sc.robots = await crawler.getRobotsTxt(scrapeOptions.skipTlsVerification);
+          const robotsCrawlDelay = crawler.getRobotsCrawlDelay();
+          if (robotsCrawlDelay !== null && !sc.crawlerOptions.delay) {
+            sc.crawlerOptions.delay = robotsCrawlDelay;
+          }
+        } catch (e) {
+          logger.debug("Failed to get robots.txt (this is probably fine!)", {
+            error: e,
+          });
+        }
+      
+        await saveCrawl(crawlId, sc);
+      
+        await _addScrapeJobToBullMQ(
+          {
+            url: url,
+            mode: "kickoff" as const,
+            team_id: teamId,
+            crawlerOptions,
+            scrapeOptions: sc.scrapeOptions,
+            internalOptions: sc.internalOptions,
+            origin: "precrawl",
+            integration: null,
+            crawl_id: crawlId,
+            webhook: undefined,
+            v1: true,
+            zeroDataRetention: false,
+          },
+          {},
+          crypto.randomUUID(),
+          10,
+        );
+      } catch (e) {
+        logger.error("Error processing one cycle of the precrawl job", { error: e });
+      }
+    }
+
+  } catch (error) {
+    logger.error("Error processing precrawl job", { error });
+    await job.moveToFailed(error, token, false);
+  } finally {
+    clearInterval(extendLockInterval);
+  }
 };
 
 let isShuttingDown = false;
@@ -226,15 +306,53 @@ const workerFun = async (queue: Queue, jobProcessor: (token: string, job: Job) =
   process.exit(0);
 };
 
+const INDEX_INSERT_INTERVAL = 3000;
+const WEBHOOK_INSERT_INTERVAL = 15000;
+const OMCE_INSERT_INTERVAL = 5000;
+
 // Start the workers
 (async () => {
-  // Start index worker
-  const indexWorkerPromise = workerFun(getIndexQueue(), processJobInternal);
-  
   // Start billing worker and batch processing
   startBillingBatchProcessing();
   const billingWorkerPromise = workerFun(getBillingQueue(), processBillingJobInternal);
-  
-  // Wait for both workers to complete (which should only happen on shutdown)
-  await Promise.all([indexWorkerPromise, billingWorkerPromise]);
+  const precrawlWorkerPromise = process.env.PRECRAWL_TEAM_ID
+    ? workerFun(getPrecrawlQueue(), processPrecrawlJobInternal)
+    : (async () => { logger.warn("PRECRAWL_TEAM_ID not set, skipping precrawl worker"); })();
+
+  const indexInserterInterval = setInterval(async () => {
+    if (isShuttingDown) {
+      return;
+    }
+    
+    await processIndexInsertJobs();
+  }, INDEX_INSERT_INTERVAL);
+
+  const webhookInserterInterval = setInterval(async () => {
+    if (isShuttingDown) {
+      return;
+    }
+    await processWebhookInsertJobs();
+  }, WEBHOOK_INSERT_INTERVAL);
+
+  const indexRFInserterInterval = setInterval(async () => {
+    if (isShuttingDown) {
+      return;
+    }
+    await processIndexRFInsertJobs();
+  }, INDEX_INSERT_INTERVAL);
+
+  const omceInserterInterval = setInterval(async () => {
+    if (isShuttingDown) {
+      return;
+    }
+    await processOMCEJobs();
+  }, OMCE_INSERT_INTERVAL);
+
+  // Wait for all workers to complete (which should only happen on shutdown)
+  await Promise.all([billingWorkerPromise, precrawlWorkerPromise]);
+
+  clearInterval(indexInserterInterval);
+  clearInterval(webhookInserterInterval);
+  clearInterval(indexRFInserterInterval);
+  clearInterval(omceInserterInterval);
 })();

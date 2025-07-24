@@ -1,7 +1,8 @@
 import { Request, Response } from "express";
 import { RequestWithAuth } from "./types";
-import { getACUC } from "../auth";
+import { getACUCTeam } from "../auth";
 import { logger } from "../../lib/logger";
+import { RateLimiterMode } from "../../types";
 
 export async function creditUsageController(
   req: RequestWithAuth,
@@ -20,7 +21,7 @@ export async function creditUsageController(
     }
 
     // Otherwise fetch fresh data
-    const chunk = await getACUC(req.auth.team_id);
+    const chunk = await getACUCTeam(req.auth.team_id, false, false, RateLimiterMode.Scrape);
     if (!chunk) {
       res.status(404).json({
         success: false,

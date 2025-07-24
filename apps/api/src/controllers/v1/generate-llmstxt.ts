@@ -1,5 +1,6 @@
 import { Response } from "express";
 import {
+  ErrorResponse,
   GenerateLLMsTextRequest,
   generateLLMsTextRequestSchema,
   RequestWithAuth,
@@ -7,9 +8,8 @@ import {
 import { getGenerateLlmsTxtQueue } from "../../services/queue-service";
 import * as Sentry from "@sentry/node";
 import { saveGeneratedLlmsTxt } from "../../lib/generate-llmstxt/generate-llmstxt-redis";
-import { z } from "zod";
 
-export type GenerateLLMsTextResponse = {
+export type GenerateLLMsTextResponse = ErrorResponse | {
   success: boolean;
   id: string;
 };
@@ -24,13 +24,16 @@ export async function generateLLMsTextController(
   req: RequestWithAuth<{}, GenerateLLMsTextResponse, GenerateLLMsTextRequest>,
   res: Response<GenerateLLMsTextResponse>,
 ) {
+  if (req.acuc?.flags?.forceZDR) {
+    return res.status(400).json({ success: false, error: "Your team has zero data retention enabled. This is not supported on llmstxt. Please contact support@firecrawl.com to unblock this feature." });
+  }
+
   req.body = generateLLMsTextRequestSchema.parse(req.body);
 
   const generationId = crypto.randomUUID();
   const jobData = {
     request: req.body,
     teamId: req.auth.team_id,
-    plan: req.auth.plan,
     subId: req.acuc?.sub_id,
     generationId,
   };
@@ -38,12 +41,12 @@ export async function generateLLMsTextController(
   await saveGeneratedLlmsTxt(generationId, {
     id: generationId,
     team_id: req.auth.team_id,
-    plan: req.auth.plan!, // Add non-null assertion since plan is required
     createdAt: Date.now(),
     status: "processing",
     url: req.body.url,
     maxUrls: req.body.maxUrls,
     showFullText: req.body.showFullText,
+    cache: req.body.cache,
     generatedText: "",
     fullText: "",
   });

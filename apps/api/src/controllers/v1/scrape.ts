@@ -1,5 +1,5 @@
 import { Response } from "express";
-import { logger } from "../../lib/logger";
+import { logger as _logger } from "../../lib/logger";
 import {
   Document,
   RequestWithAuth,
@@ -7,12 +7,9 @@ import {
   scrapeRequestSchema,
   ScrapeResponse,
 } from "./types";
-import { billTeam } from "../../services/billing/credit_billing";
 import { v4 as uuidv4 } from "uuid";
 import { addScrapeJob, waitForJob } from "../../services/queue-jobs";
-import { logJob } from "../../services/logging/log_job";
 import { getJobPriority } from "../../lib/job-priority";
-import { PlanType } from "../../types";
 import { getScrapeQueue } from "../../services/queue-service";
 
 export async function scrapeController(
@@ -21,43 +18,73 @@ export async function scrapeController(
 ) {
   const jobId = uuidv4();
   const preNormalizedBody = { ...req.body };
+
+  if (req.body.zeroDataRetention && !req.acuc?.flags?.allowZDR) {
+    return res.status(400).json({
+      success: false,
+      error: "Zero data retention is enabled for this team. If you're interested in ZDR, please contact support@firecrawl.com",
+    });
+  }
+
+  const zeroDataRetention = req.acuc?.flags?.forceZDR || req.body.zeroDataRetention;
+
+  const logger = _logger.child({
+    method: "scrapeController",
+    jobId,
+    scrapeId: jobId,
+    teamId: req.auth.team_id,
+    team_id: req.auth.team_id,
+    zeroDataRetention,
+  });
  
   logger.debug("Scrape " + jobId + " starting", {
     scrapeId: jobId,
     request: req.body,
     originalRequest: preNormalizedBody,
-    teamId: req.auth.team_id,
     account: req.account,
   });
 
   req.body = scrapeRequestSchema.parse(req.body);
-  let earlyReturn = false;
 
   const origin = req.body.origin;
   const timeout = req.body.timeout;
 
   const startTime = new Date().getTime();
   const jobPriority = await getJobPriority({
-    plan: req.auth.plan as PlanType,
     team_id: req.auth.team_id,
     basePriority: 10,
   });
-  // 
 
+  const isDirectToBullMQ = process.env.SEARCH_PREVIEW_TOKEN !== undefined && process.env.SEARCH_PREVIEW_TOKEN === req.body.__searchPreviewToken;
+  
   await addScrapeJob(
     {
       url: req.body.url,
       mode: "single_urls",
       team_id: req.auth.team_id,
-      scrapeOptions: req.body,
-      internalOptions: { teamId: req.auth.team_id },
-      plan: req.auth.plan!,
-      origin: req.body.origin,
-      is_scrape: true,
+      scrapeOptions: {
+        ...req.body,
+        ...(req.body.__experimental_cache ? {
+          maxAge: req.body.maxAge ?? 4 * 60 * 60 * 1000, // 4 hours
+        } : {}),
+      },
+      internalOptions: {
+        teamId: req.auth.team_id,
+        saveScrapeResultToGCS: process.env.GCS_FIRE_ENGINE_BUCKET_NAME ? true : false,
+        unnormalizedSourceURL: preNormalizedBody.url,
+        bypassBilling: isDirectToBullMQ,
+        zeroDataRetention,
+        teamFlags: req.acuc?.flags ?? null,
+      },
+      origin,
+      integration: req.body.integration,
+      startTime,
+      zeroDataRetention,
     },
     {},
     jobId,
     jobPriority,
+    isDirectToBullMQ,
   );
 
   const totalWait =
@@ -69,13 +96,16 @@ export async function scrapeController(
 
   let doc: Document;
   try {
-    doc = await waitForJob<Document>(jobId, timeout + totalWait); // TODO: better types for this
+    doc = await waitForJob(jobId, timeout + totalWait);
   } catch (e) {
-    logger.error(`Error in scrapeController: ${e}`, {
-      jobId,
-      scrapeId: jobId,
+    logger.error(`Error in scrapeController`, {
       startTime,
     });
+
+    if (zeroDataRetention) {
+      await getScrapeQueue().remove(jobId);
+    }
+
     if (
       e instanceof Error &&
       (e.message.startsWith("Job wait") || e.message === "timeout")
@@ -93,53 +123,12 @@ export async function scrapeController(
   }
 
   await getScrapeQueue().remove(jobId);
-
-  const endTime = new Date().getTime();
-  const timeTakenInSeconds = (endTime - startTime) / 1000;
-  const numTokens =
-    doc && doc.extract
-      ? // ? numTokensFromString(doc.markdown, "gpt-3.5-turbo")
-        0 // TODO: fix
-      : 0;
-
-  let creditsToBeBilled = 1; // Assuming 1 credit per document
-  if (earlyReturn) {
-    // Don't bill if we're early returning
-    return;
-  }
-  if (req.body.extract && req.body.formats.includes("extract")) {
-    creditsToBeBilled = 5;
-  }
-
-  billTeam(req.auth.team_id, req.acuc?.sub_id, creditsToBeBilled).catch(
-    (error) => {
-      logger.error(
-        `Failed to bill team ${req.auth.team_id} for ${creditsToBeBilled} credits: ${error}`,
-      );
-      // Optionally, you could notify an admin or add to a retry queue here
-    },
-  );
-
+  
   if (!req.body.formats.includes("rawHtml")) {
     if (doc && doc.rawHtml) {
       delete doc.rawHtml;
     }
   }
-
-  logJob({
-    job_id: jobId,
-    success: true,
-    message: "Scrape completed",
-    num_docs: 1,
-    docs: [doc],
-    time_taken: timeTakenInSeconds,
-    team_id: req.auth.team_id,
-    mode: "scrape",
-    url: req.body.url,
-    scrapeOptions: req.body,
-    origin: origin,
-    num_tokens: numTokens,
-  });
 
   return res.status(200).json({
     success: true,

@@ -7,8 +7,12 @@ import { extractMetadata } from "../lib/extractMetadata";
 import { performLLMExtract } from "./llmExtract";
 import { uploadScreenshot } from "./uploadScreenshot";
 import { removeBase64Images } from "./removeBase64Images";
-import { saveToCache } from "./cache";
+import { performAgent } from "./agent";
+
 import { deriveDiff } from "./diff";
+import { useIndex } from "../../../services/index";
+import { sendDocumentToIndex } from "../engines/index/index";
+
 export type Transformer = (
   meta: Meta,
   document: Document,
@@ -43,14 +47,14 @@ export async function deriveHTMLFromRawHTML(
 
   document.html = await htmlTransform(
     document.rawHtml,
-    document.metadata.url ?? document.metadata.sourceURL ?? meta.url,
+    document.metadata.url ?? document.metadata.sourceURL ?? meta.rewrittenUrl ?? meta.url,
     meta.options,
   );
   return document;
 }
 
 export async function deriveMarkdownFromHTML(
-  _meta: Meta,
+  meta: Meta,
   document: Document,
 ): Promise<Document> {
   if (document.html === undefined) {
@@ -59,7 +63,40 @@ export async function deriveMarkdownFromHTML(
     );
   }
 
+  if (document.metadata.contentType?.includes("application/json")) {
+    if (document.rawHtml === undefined) {
+      throw new Error(
+        "rawHtml is undefined -- this transformer is being called out of order",
+      );
+    }
+
+    document.markdown = "```json\n" + document.rawHtml + "\n```";
+    return document;
+  }
+
   document.markdown = await parseMarkdown(document.html);
+
+  if (meta.options.onlyMainContent === true && 
+      (!document.markdown || document.markdown.trim().length === 0)) {
+    
+    meta.logger.info("Main content extraction resulted in empty markdown, falling back to full content extraction");
+    
+    const fallbackMeta = {
+      ...meta,
+      options: {
+        ...meta.options,
+        onlyMainContent: false
+      }
+    };
+    
+    document = await deriveHTMLFromRawHTML(fallbackMeta, document);
+    document.markdown = await parseMarkdown(document.html);
+    
+    meta.logger.info("Fallback to full content extraction completed", {
+      markdownLength: document.markdown?.length || 0
+    });
+  }
+
   return document;
 }
 
@@ -72,7 +109,7 @@ export async function deriveLinksFromHTML(meta: Meta, document: Document): Promi
       );
     }
 
-    document.links = await extractLinks(document.html, meta.url);
+    document.links = await extractLinks(document.html, document.metadata.url ?? document.metadata.sourceURL ?? meta.rewrittenUrl ?? meta.url);
   }
 
   return document;
@@ -148,15 +185,33 @@ export function coerceFieldsToFormats(
     );
   }
 
-  if (!formats.has("compare") && document.compare !== undefined) {
+  if (!formats.has("changeTracking") && document.changeTracking !== undefined) {
     meta.logger.warn(
-      "Removed compare from Document because it wasn't in formats -- this is extremely wasteful and indicates a bug.",
+      "Removed changeTracking from Document because it wasn't in formats -- this is extremely wasteful and indicates a bug.",
     );
-    delete document.compare;
-  } else if (formats.has("compare") && document.compare === undefined) {
+    delete document.changeTracking;
+  } else if (formats.has("changeTracking") && document.changeTracking === undefined) {
     meta.logger.warn(
-      "Request had format compare, but there was no compare field in the result.",
+      "Request had format changeTracking, but there was no changeTracking field in the result.",
     );
+  }
+
+  if (document.changeTracking && 
+      (!meta.options.changeTrackingOptions?.modes?.includes("git-diff")) && 
+      document.changeTracking.diff !== undefined) {
+    meta.logger.warn(
+      "Removed diff from changeTracking because git-diff mode wasn't specified in changeTrackingOptions.modes.",
+    );
+    delete document.changeTracking.diff;
+  }
+  
+  if (document.changeTracking && 
+      (!meta.options.changeTrackingOptions?.modes?.includes("json")) && 
+      document.changeTracking.json !== undefined) {
+    meta.logger.warn(
+      "Removed structured from changeTracking because structured mode wasn't specified in changeTrackingOptions.modes.",
+    );
+    delete document.changeTracking.json;
   }
 
   if (meta.options.actions === undefined || meta.options.actions.length === 0) {
@@ -168,13 +223,14 @@ export function coerceFieldsToFormats(
 
 // TODO: allow some of these to run in parallel
 export const transformerStack: Transformer[] = [
-  saveToCache,
   deriveHTMLFromRawHTML,
   deriveMarkdownFromHTML,
   deriveLinksFromHTML,
   deriveMetadataFromRawHTML,
   uploadScreenshot,
+  ...(useIndex ? [sendDocumentToIndex] : []),
   performLLMExtract,
+  performAgent,
   deriveDiff,
   coerceFieldsToFormats,
   removeBase64Images,
