@@ -16,6 +16,7 @@ export async function scrapeURLWithPlaywright(
       url: process.env.PLAYWRIGHT_MICROSERVICE_URL!,
       headers: {
         "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true",
       },
       body: {
         url: meta.rewrittenUrl ?? meta.url,
