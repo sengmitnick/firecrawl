@@ -96,25 +96,6 @@ const initializeBrowser = async () => {
     });
   }
 
-  await context.route(
-    "*/**/public/**/login",
-    async (route: Route, request: PlaywrightRequest) => {
-      return route.continue({
-        postData: JSON.stringify({
-          code: "000000",
-          message: "成功",
-          debugTrace: null,
-          data: {
-            access_token:
-              "76_JVpSad55vObpDKF_UE4HlMExZTtwX6A66WxnWKKY0VAQjTefJmOWfxWi0ap9phdb6kLkABHORZ3ikfYD_9AxAJ4K8E0CjlEMQlgCKuq1EBs",
-            openid: "o33NMs-U0tpD2IB8Oxx11sZwTJ2Y",
-            unionid: "oe-p46Fl1Elb3K7ku2-22cbrZXcA",
-          },
-        }),
-      });
-    }
-  );
-
   // Intercept all requests to avoid loading ads
   await context.route('**/*', (route: Route, request: PlaywrightRequest) => {
     const requestUrl = new URL(request.url());
@@ -149,30 +130,6 @@ const isValidUrl = (urlString: string): boolean => {
 const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networkidle', waitAfterLoad: number, timeout: number, checkSelector: string | undefined) => {
   console.log(`Navigating to ${url} with waitUntil: ${waitUntil} and timeout: ${timeout}ms`);
   const response = await page.goto(url, { waitUntil, timeout });
-
-  if (url.includes("mp.weixin.qq.com")) {
-    await page.addInitScript(`
-Object.defineProperty(window, 'wx', {  
-          value: {  
-              config: function(options) {  
-                  // 模拟 wx.config 的逻辑  
-                  console.log('Mock wx.config called with options:', options);  
-              },  
-              ready: function(callback) {  
-                  // 假设 ready 是立即执行的  
-                  callback();  
-              },  
-              error: function(callback) {  
-                  // 模拟错误处理的逻辑  
-              },  
-              // ... 其他需要模拟的 wx API  
-          },  
-          writable: false, // 防止被重写  
-          enumerable: true, // 使其可枚举  
-          configurable: false // 防止被删除或修改  
-      });
-`);
-  }
 
   if (waitAfterLoad > 0) {
     await page.waitForTimeout(waitAfterLoad);
