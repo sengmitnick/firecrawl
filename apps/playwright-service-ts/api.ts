@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import bodyParser from 'body-parser';
 import { chromium, Browser, BrowserContext, Route, Request as PlaywrightRequest, Page } from 'playwright';
 import dotenv from 'dotenv';
-import UserAgent from 'user-agents';
+// import UserAgent from 'user-agents';
 import { getError } from './helpers/get_error';
 
 dotenv.config();
@@ -46,26 +46,32 @@ let browser: Browser;
 let context: BrowserContext;
 
 const initializeBrowser = async () => {
-  browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu'
-    ]
+  // browser = await chromium.launch({
+  //   headless: true,
+  //   args: [
+  //     '--no-sandbox',
+  //     '--disable-setuid-sandbox',
+  //     '--disable-dev-shm-usage',
+  //     '--disable-accelerated-2d-canvas',
+  //     '--no-first-run',
+  //     '--no-zygote',
+  //     '--single-process',
+  //     '--disable-gpu'
+  //   ]
+  // });
+  
+  // 添加用户数据目录参数来解决 Chrome 远程调试问题
+  browser = await chromium.connectOverCDP('http://localhost:9222', {
+    timeout: 30000,
+    slowMo: 100
   });
 
-  let userAgent = new UserAgent().toString();
-  userAgent = userAgent + " MicroMessenger/6.8.0(0x16080000)";
+  // let userAgent = new UserAgent().toString();
+  // const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/3.8.10(0x13080a10) XWEB/1227 Flue';
   const viewport = { width: 1280, height: 800 };
 
   const contextOptions: any = {
-    userAgent,
+    // userAgent,
     viewport,
   };
 
@@ -81,7 +87,8 @@ const initializeBrowser = async () => {
     };
   }
 
-  context = await browser.newContext(contextOptions);
+  // context = await browser.newContext(contextOptions);
+  context = browser.contexts()[0];
 
   if (BLOCK_MEDIA) {
     await context.route('**/*.{png,jpg,jpeg,gif,svg,mp3,mp4,avi,flac,ogg,wav,webm}', async (route: Route, request: PlaywrightRequest) => {
@@ -171,6 +178,8 @@ Object.defineProperty(window, 'wx', {
     await page.waitForTimeout(waitAfterLoad);
   }
 
+  await page.waitForTimeout(6 * 1000);
+
   if (checkSelector) {
     try {
       await page.waitForSelector(checkSelector, { timeout });
@@ -217,7 +226,7 @@ app.get('/health', async (req: Request, res: Response) => {
 });
 
 app.post('/scrape', async (req: Request, res: Response) => {
-  const { url, wait_after_load = 0, timeout = 15000, headers, check_selector }: UrlModel = req.body;
+  const { url, wait_after_load = 0, timeout = 60000, headers, check_selector }: UrlModel = req.body;
 
   console.log(`================= Scrape Request =================`);
   console.log(`URL: ${url}`);
