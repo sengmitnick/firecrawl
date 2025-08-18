@@ -145,6 +145,24 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
     }
   }
 
+  // 检查页面是否存在 a#js_verify 元素
+  const jsVerifyElement = page.locator('a#js_verify').first();
+  const hasJsVerifyElement = await jsVerifyElement.count() > 0;
+  
+  if (hasJsVerifyElement) {
+    console.log('⚠️ 检测到验证元素 a#js_verify，准备点击验证按钮');
+    try {
+      await jsVerifyElement.click();
+      console.log('✅ 已点击验证按钮，等待页面更新...');
+      // 等待点击后的页面变化
+      await page.waitForTimeout(6 * 1000);
+    } catch (error) {
+      console.log('❌ 点击验证按钮失败:', error);
+    }
+  } else {
+    console.log('✅ 未检测到验证元素 a#js_verify');
+  }
+
   let headers = null, content = await page.content();
   let ct: string | undefined = undefined;
   if (response) {
