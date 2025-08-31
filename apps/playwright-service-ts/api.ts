@@ -268,6 +268,103 @@ app.post('/scrape', async (req: Request, res: Response) => {
   });
 });
 
+// 收集页面后，将结果直接 POST 到回调地址，减少经由公网的响应体传输
+app.post('/scrape-and-post', async (req: Request, res: Response) => {
+  const {
+    url,
+    wait_after_load = 0,
+    timeout = 60000,
+    headers,
+    check_selector,
+    callback_url,
+    callback_headers,
+    metadata
+  }: UrlModel & {
+    callback_url: string;
+    callback_headers?: { [key: string]: string };
+    metadata?: unknown;
+  } = req.body;
+
+  console.log(`================= Scrape&Post Request =================`);
+  console.log(`URL: ${url}`);
+  console.log(`Callback URL: ${callback_url}`);
+  console.log(`Wait After Load: ${wait_after_load}`);
+  console.log(`Timeout: ${timeout}`);
+  console.log(`Headers: ${headers ? JSON.stringify(headers) : 'None'}`);
+  console.log(`Callback Headers: ${callback_headers ? JSON.stringify(callback_headers) : 'None'}`);
+  console.log(`Check Selector: ${check_selector ? check_selector : 'None'}`);
+  console.log(`========================================================`);
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+  if (!isValidUrl(url)) {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+  if (!callback_url) {
+    return res.status(400).json({ error: 'callback_url is required' });
+  }
+  if (!isValidUrl(callback_url)) {
+    return res.status(400).json({ error: 'Invalid callback_url' });
+  }
+
+  if (!PROXY_SERVER) {
+    console.warn('⚠️ WARNING: No proxy server provided. Your IP address may be blocked.');
+  }
+
+  if (!browser || !context) {
+    await initializeBrowser();
+  }
+
+  const page = await context.newPage();
+  if (headers) {
+    await page.setExtraHTTPHeaders(headers);
+  }
+
+  let result: Awaited<ReturnType<typeof scrapePage>>;
+  try {
+    console.log('Attempting strategy 1: Normal load');
+    result = await scrapePage(page, url, 'load', wait_after_load, timeout, check_selector);
+  } catch (error) {
+    console.log('Strategy 1 failed, attempting strategy 2: Wait until networkidle');
+    try {
+      result = await scrapePage(page, url, 'networkidle', wait_after_load, timeout, check_selector);
+    } catch (finalError) {
+      await page.close();
+      return res.status(500).json({ error: 'An error occurred while fetching the page.' });
+    }
+  }
+
+  const pageError = result.status !== 200 ? getError(result.status) : undefined;
+  await page.close();
+
+  const payload = {
+    url,
+    content: result.content,
+    pageStatusCode: result.status,
+    contentType: result.contentType,
+    ...(pageError && { pageError }),
+    ...(metadata !== undefined ? { metadata } : {})
+  };
+
+  try {
+    const resp = await fetch(callback_url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(callback_headers || {})
+      },
+      body: JSON.stringify(payload)
+    });
+
+    console.log(`Posted to callback. Status: ${resp.status}`);
+    return res.status(200).json({ ok: true, callbackStatus: resp.status });
+  } catch (postErr) {
+    console.error('Failed to POST to callback:', postErr);
+    return res.status(502).json({ error: 'Failed to POST to callback' });
+  }
+});
+
 app.listen(port, () => {
   initializeBrowser().then(() => {
     console.log(`Server is running on port ${port}`);
