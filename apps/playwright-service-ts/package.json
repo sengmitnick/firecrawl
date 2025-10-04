@@ -6,7 +6,16 @@
   "scripts": {
     "start": "node dist/api.js",
     "build": "tsc",
-    "dev": "ts-node api.ts"
+    "dev": "ts-node api.ts",
+    "pm2:start": "pm2 start npm --name playwright-service-ts -- start",
+    "pm2:restart": "pm2 restart playwright-service-ts || pm2 start npm --name playwright-service-ts -- start",
+    "pm2:stop": "pm2 stop playwright-service-ts || true",
+    "pm2:delete": "pm2 delete playwright-service-ts || true",
+    "pm2:status": "pm2 status",
+    "pm2:logs": "pm2 logs playwright-service-ts --lines 200",
+    "pm2:enable": "pm2 startup && pm2 save",
+    "pm2:cluster": "pm2 start npm --name playwright-service-ts -i max -- start",
+    "pm2:memwatch": "pm2 restart playwright-service-ts --max-memory-restart 500M"
   },
   "keywords": [],
   "author": "Jeff Pereira",
