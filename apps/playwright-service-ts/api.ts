@@ -135,33 +135,97 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
     await page.waitForTimeout(waitAfterLoad);
   }
 
-  await page.waitForTimeout(6 * 1000);
+  // 缩短初始等待，优先检测验证元素
+  await page.waitForTimeout(3 * 1000);
 
+  // 检测并处理微信验证（最多尝试2次）
+  let verifyAttempts = 0;
+  const maxVerifyAttempts = 2;
+
+  while (verifyAttempts < maxVerifyAttempts) {
+    const jsVerifyElement = page.locator('a#js_verify').first();
+    const hasJsVerifyElement = await jsVerifyElement.count() > 0;
+
+    if (hasJsVerifyElement) {
+      verifyAttempts++;
+      console.log(`⚠️ 检测到验证元素 a#js_verify (尝试 ${verifyAttempts}/${maxVerifyAttempts})，准备点击验证按钮`);
+
+      try {
+        // 点击验证按钮
+        await jsVerifyElement.click();
+        console.log('✅ 已点击验证按钮，等待页面加载...');
+
+        // 等待页面可能的导航/刷新
+        try {
+          await page.waitForLoadState('networkidle', { timeout: 15000 });
+          console.log('✅ 页面已重新加载');
+        } catch (e) {
+          console.log('⚠️ 页面加载超时，继续处理');
+        }
+
+        // 等待验证元素消失或内容元素出现
+        await page.waitForTimeout(3 * 1000);
+
+        // 检查验证是否成功（验证元素应该消失）
+        const verifyStillExists = await page.locator('a#js_verify').count() > 0;
+        if (!verifyStillExists) {
+          console.log('✅ 验证成功，验证元素已消失');
+          break;
+        } else {
+          console.log('⚠️ 验证元素仍然存在，可能需要重试');
+          if (verifyAttempts < maxVerifyAttempts) {
+            await page.waitForTimeout(2 * 1000);
+          }
+        }
+      } catch (error) {
+        console.log(`❌ 点击验证按钮失败 (尝试 ${verifyAttempts}):`, error);
+        await page.waitForTimeout(3 * 1000);
+      }
+    } else {
+      console.log('✅ 未检测到验证元素 a#js_verify');
+      break;
+    }
+  }
+
+  // 等待微信公众号文章的关键内容元素加载（更加准确的选择器）
+  const contentSelectors = [
+    '#activity-name',                    // 文章标题（新版）
+    '#js_content',                       // 文章内容（核心）
+    'div.rich_media_content',            // 富媒体内容（核心）
+    'div#page-content',                  // 页面内容
+  ];
+
+  let contentLoaded = false;
+  for (const selector of contentSelectors) {
+    try {
+      await page.waitForSelector(selector, { timeout: 8000, state: 'visible' });
+      console.log(`✅ 内容元素已加载: ${selector}`);
+      contentLoaded = true;
+      break;
+    } catch (error) {
+      // 继续尝试下一个选择器
+    }
+  }
+
+  if (!contentLoaded) {
+    console.log('⚠️ 未检测到标准内容元素，可能不是微信公众号文章或被拦截');
+    // 即使没有检测到标准元素，也等待一段时间让页面完全加载
+    await page.waitForTimeout(3 * 1000);
+  }
+
+  // 检查自定义选择器
   if (checkSelector) {
     try {
-      await page.waitForSelector(checkSelector, { timeout });
+      await page.waitForSelector(checkSelector, { timeout, state: 'visible' });
+      console.log(`✅ 自定义选择器已找到: ${checkSelector}`);
     } catch (error) {
+      console.log(`⚠️ 自定义选择器未找到: ${checkSelector}`);
       throw new Error('Required selector not found');
     }
   }
 
-  // 检查页面是否存在 a#js_verify 元素
-  const jsVerifyElement = page.locator('a#js_verify').first();
-  const hasJsVerifyElement = await jsVerifyElement.count() > 0;
-  
-  if (hasJsVerifyElement) {
-    console.log('⚠️ 检测到验证元素 a#js_verify，准备点击验证按钮');
-    try {
-      await jsVerifyElement.click();
-      console.log('✅ 已点击验证按钮，等待页面更新...');
-      // 等待点击后的页面变化
-      await page.waitForTimeout(6 * 1000);
-    } catch (error) {
-      console.log('❌ 点击验证按钮失败:', error);
-    }
-  } else {
-    console.log('✅ 未检测到验证元素 a#js_verify');
-  }
+  // 最后等待一小段时间确保动态内容渲染
+  await page.waitForTimeout(2 * 1000);
 
   let headers = null, content = await page.content();
   let ct: string | undefined = undefined;
@@ -173,11 +237,41 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
     }
   }
 
+  // 验证内容完整性
+  const title = await page.title();
+  console.log(`📄 页面标题: ${title}`);
+
+  // 检查是否仍然被拦截或验证失败
+  const isBlocked = !title || title === '微信公众平台' || title.includes('登录') || title.includes('验证');
+  const hasVerifyElement = await page.locator('a#js_verify').count() > 0;
+
+  if (isBlocked) {
+    console.log('❌ 页面标题异常，内容可能不完整或被拦截');
+  }
+
+  if (hasVerifyElement) {
+    console.log('❌ 验证元素仍然存在，验证未成功完成');
+  }
+
+  // 检查HTML内容是否实际有内容（非空白）
+  const htmlLength = content.length;
+  const hasSubstantialContent = htmlLength > 5000; // 正常的微信文章HTML应该至少有5KB
+  console.log(`📊 HTML内容长度: ${htmlLength} bytes`);
+
+  if (!hasSubstantialContent) {
+    console.log('⚠️ 警告：HTML内容过短，可能获取不完整');
+  }
+
   return {
     content,
     status: response ? response.status() : null,
     headers,
     contentType: ct,
+    pageTitle: title,
+    contentLoaded,
+    isBlocked,
+    hasVerifyElement,
+    contentLength: htmlLength,
   };
 };
 
