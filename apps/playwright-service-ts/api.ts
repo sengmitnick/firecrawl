@@ -127,49 +127,6 @@ const isValidUrl = (urlString: string): boolean => {
   }
 };
 
-// 检查页面内容是否完整和有效
-const validatePageContent = async (page: Page): Promise<{ isValid: boolean; reason?: string }> => {
-  const title = await page.title();
-
-  // 检查标题是否为空或为默认值
-  if (!title || title.trim() === '') {
-    return { isValid: false, reason: '页面标题为空' };
-  }
-
-  if (title === '微信公众平台' || title.includes('登录') || title.includes('验证')) {
-    return { isValid: false, reason: `页面标题异常: ${title}` };
-  }
-
-  // 检查是否存在验证元素（未处理）
-  const verifyElement = await page.locator('a#js_verify').count();
-  if (verifyElement > 0) {
-    return { isValid: false, reason: '仍然存在验证元素' };
-  }
-
-  // 检查是否有内容元素
-  const contentSelectors = [
-    '#activity-name',
-    '#js_name',
-    '#js_content',
-    'div.rich_media_content'
-  ];
-
-  let hasContent = false;
-  for (const selector of contentSelectors) {
-    const count = await page.locator(selector).count();
-    if (count > 0) {
-      hasContent = true;
-      break;
-    }
-  }
-
-  if (!hasContent) {
-    return { isValid: false, reason: '未找到文章内容元素' };
-  }
-
-  return { isValid: true };
-};
-
 const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networkidle', waitAfterLoad: number, timeout: number, checkSelector: string | undefined) => {
   console.log(`Navigating to ${url} with waitUntil: ${waitUntil} and timeout: ${timeout}ms`);
   const response = await page.goto(url, { waitUntil, timeout });
@@ -178,72 +135,33 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
     await page.waitForTimeout(waitAfterLoad);
   }
 
-  // 先等待初始加载（缩短为3秒）
-  await page.waitForTimeout(3 * 1000);
+  await page.waitForTimeout(6 * 1000);
 
-  // 优先检测验证元素，立即处理
+  if (checkSelector) {
+    try {
+      await page.waitForSelector(checkSelector, { timeout });
+    } catch (error) {
+      throw new Error('Required selector not found');
+    }
+  }
+
+  // 检查页面是否存在 a#js_verify 元素
   const jsVerifyElement = page.locator('a#js_verify').first();
   const hasJsVerifyElement = await jsVerifyElement.count() > 0;
-
+  
   if (hasJsVerifyElement) {
     console.log('⚠️ 检测到验证元素 a#js_verify，准备点击验证按钮');
     try {
       await jsVerifyElement.click();
       console.log('✅ 已点击验证按钮，等待页面更新...');
-      // 点击后等待页面重新加载
-      await page.waitForLoadState('networkidle', { timeout: timeout });
-      // 额外等待确保内容渲染
-      await page.waitForTimeout(3 * 1000);
+      // 等待点击后的页面变化
+      await page.waitForTimeout(6 * 1000);
     } catch (error) {
       console.log('❌ 点击验证按钮失败:', error);
-      // 即使点击失败，也继续等待页面稳定
-      await page.waitForTimeout(3 * 1000);
     }
   } else {
     console.log('✅ 未检测到验证元素 a#js_verify');
-    // 没有验证元素时，等待页面稳定
-    await page.waitForTimeout(3 * 1000);
   }
-
-  // 等待微信公众号文章的关键元素加载（多个可能的选择器）
-  const contentSelectors = [
-    '#activity-name',           // 文章标题（新版）
-    '#js_name',                 // 文章标题（旧版）
-    '#js_content',              // 文章内容
-    '#img-content',             // 图文消息内容
-    'div.rich_media_title',     // 富媒体标题
-    'div.rich_media_content'    // 富媒体内容
-  ];
-
-  let contentFound = false;
-  for (const selector of contentSelectors) {
-    try {
-      await page.waitForSelector(selector, { timeout: 5000, state: 'visible' });
-      console.log(`✅ 检测到内容元素: ${selector}`);
-      contentFound = true;
-      break;
-    } catch (error) {
-      // 继续尝试下一个选择器
-    }
-  }
-
-  if (!contentFound) {
-    console.log('⚠️ 未检测到常见内容元素，可能不是标准的微信公众号文章页面');
-  }
-
-  // 检查自定义选择器
-  if (checkSelector) {
-    try {
-      await page.waitForSelector(checkSelector, { timeout, state: 'visible' });
-      console.log(`✅ 自定义选择器已找到: ${checkSelector}`);
-    } catch (error) {
-      console.log(`⚠️ 自定义选择器未找到: ${checkSelector}`);
-      throw new Error('Required selector not found');
-    }
-  }
-
-  // 再次等待确保动态内容渲染完成
-  await page.waitForTimeout(2 * 1000);
 
   let headers = null, content = await page.content();
   let ct: string | undefined = undefined;
@@ -253,21 +171,6 @@ const scrapePage = async (page: Page, url: string, waitUntil: 'load' | 'networki
     if (ct && (ct[1].includes("application/json") || ct[1].includes("text/plain"))) {
       content = (await response.body()).toString("utf8"); // TODO: determine real encoding
     }
-  }
-
-  // 内容完整性验证
-  const title = await page.title();
-  console.log(`📄 页面标题: ${title}`);
-
-  if (!title || title === '微信公众平台' || title.includes('验证')) {
-    console.log('⚠️ 警告：页面标题可能不正确，内容可能不完整');
-  }
-
-  // 检查页面内容是否包含错误标识
-  if (content.includes('该内容被投诉且经审核涉嫌违规') ||
-      content.includes('此内容因违规无法查看') ||
-      content.includes('该内容已被发布者删除')) {
-    console.log('⚠️ 检测到内容违规或已删除提示');
   }
 
   return {
@@ -347,14 +250,6 @@ app.post('/scrape', async (req: Request, res: Response) => {
     }
   }
 
-  // 验证页面内容完整性
-  const validation = await validatePageContent(page);
-  if (!validation.isValid) {
-    console.log(`⚠️ 页面内容验证失败: ${validation.reason}`);
-  } else {
-    console.log(`✅ 页面内容验证通过`);
-  }
-
   const pageError = result.status !== 200 ? getError(result.status) : undefined;
 
   if (!pageError) {
@@ -369,8 +264,6 @@ app.post('/scrape', async (req: Request, res: Response) => {
     content: result.content,
     pageStatusCode: result.status,
     contentType: result.contentType,
-    contentValid: validation.isValid,
-    ...(validation.reason && { validationWarning: validation.reason }),
     ...(pageError && { pageError })
   });
 });
@@ -442,14 +335,6 @@ app.post('/scrape-and-post', async (req: Request, res: Response) => {
     }
   }
 
-  // 验证页面内容完整性
-  const validation = await validatePageContent(page);
-  if (!validation.isValid) {
-    console.log(`⚠️ 页面内容验证失败: ${validation.reason}`);
-  } else {
-    console.log(`✅ 页面内容验证通过`);
-  }
-
   const pageError = result.status !== 200 ? getError(result.status) : undefined;
   await page.close();
 
@@ -458,8 +343,6 @@ app.post('/scrape-and-post', async (req: Request, res: Response) => {
     content: result.content,
     pageStatusCode: result.status,
     contentType: result.contentType,
-    contentValid: validation.isValid,
-    ...(validation.reason && { validationWarning: validation.reason }),
     ...(pageError && { pageError }),
     ...(metadata !== undefined ? { metadata } : {})
   };
