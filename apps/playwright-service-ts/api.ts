@@ -45,6 +45,58 @@ interface UrlModel {
 let browser: Browser;
 let context: BrowserContext;
 
+/**
+ * 在后台创建一个新 Tab，不抢占用户焦点。
+ * 原理：通过 CDP Target.createTarget 的 background:true + hidden:true 参数
+ * 让 Chrome 在后台静默创建标签页，然后等待 Playwright context 捕获到对应 Page。
+ *
+ * 若 CDP 方式不可用（旧版 Chrome / 参数不支持），则回退到标准 newPage()。
+ */
+const newBackgroundPage = async (): Promise<Page> => {
+  try {
+    const cdpSession = await browser.newBrowserCDPSession();
+    // background:true — 不聚焦该 tab；hidden:true — tab 栏也不显示（实验性，Chrome 112+）
+    const { targetId } = await cdpSession.send('Target.createTarget', {
+      url: 'about:blank',
+      background: true,
+      hidden: true,
+    }) as { targetId: string };
+    await cdpSession.detach();
+
+    // 等待 Playwright context 捕获到这个 Target 对应的 Page（最多等 5 秒）
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const pages = context.pages();
+      // Playwright 暴露的 page._guid / page._channel 里可通过内部 targetId 匹配
+      // 更可靠的方式：通过 page.url() + 时序来找最新的 about:blank
+      const page = pages.find(p => {
+        // @ts-ignore — 访问 Playwright 内部属性拿 targetId
+        return (p as any)._channel?._object?.targetId === targetId
+          || (p as any)._targetId === targetId;
+      });
+      if (page) {
+        console.log('✅ Background page created via CDP (no focus steal)');
+        return page;
+      }
+      await new Promise(r => setTimeout(r, 50));
+    }
+
+    // 匹配不到则找最后一个 about:blank 页面（时序兜底）
+    const pages = context.pages();
+    const blankPage = [...pages].reverse().find(p => p.url() === 'about:blank');
+    if (blankPage) {
+      console.log('✅ Background page found via about:blank fallback');
+      return blankPage;
+    }
+
+    throw new Error('CDP background page created but not found in context');
+  } catch (err) {
+    // 回退：旧版 Chrome 或 hidden 参数不支持时，用标准 newPage（会抢焦点）
+    console.warn('⚠️ CDP background page failed, falling back to newPage():', (err as Error).message);
+    return context.newPage();
+  }
+};
+
 const initializeBrowser = async () => {
   // browser = await chromium.launch({
   //   headless: true,
@@ -321,7 +373,7 @@ app.post('/scrape', async (req: Request, res: Response) => {
     await initializeBrowser();
   }
 
-  const page = await context.newPage();
+  const page = await newBackgroundPage();
 
   // Set headers if provided
   if (headers) {
@@ -410,7 +462,7 @@ app.post('/scrape-and-post', async (req: Request, res: Response) => {
     await initializeBrowser();
   }
 
-  const page = await context.newPage();
+  const page = await newBackgroundPage();
   if (headers) {
     await page.setExtraHTTPHeaders(headers);
   }
