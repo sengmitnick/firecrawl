@@ -46,52 +46,77 @@ let browser: Browser;
 let context: BrowserContext;
 
 /**
- * 在后台创建一个新 Tab，不抢占用户焦点。
- * 原理：通过 CDP Target.createTarget 的 background:true + hidden:true 参数
- * 让 Chrome 在后台静默创建标签页，然后等待 Playwright context 捕获到对应 Page。
+ * 在后台创建新 Tab，尽量不抢占用户焦点。
  *
- * 若 CDP 方式不可用（旧版 Chrome / 参数不支持），则回退到标准 newPage()。
+ * 策略（三层）：
+ * 1. CDP Target.createTarget + background:true + focus:false
+ *    - background:true  — Chrome 不切换到该 tab
+ *    - focus:false      — 实验性参数（Chrome 112+），进一步阻止焦点转移
+ *    - 创建前记录当前活跃 tab，创建后立刻 activateTarget 切回去（双重保险）
+ *    - 通过 context 的 'page' 事件可靠获取 Page 对象（不依赖内部属性）
+ * 2. 若以上失败，直接用 context.newPage()（会抢焦点，最后兜底）
  */
 const newBackgroundPage = async (): Promise<Page> => {
+  let cdpSession: import('playwright-core').CDPSession | null = null;
   try {
-    const cdpSession = await browser.newBrowserCDPSession();
-    // background:true — 不聚焦该 tab；hidden:true — tab 栏也不显示（实验性，Chrome 112+）
-    const { targetId } = await cdpSession.send('Target.createTarget', {
+    cdpSession = await browser.newBrowserCDPSession();
+
+    // 1. 记录创建前已存在的 pages（用于事后恢复焦点到其中第一个）
+    const existingPages = context.pages();
+    const firstExistingPage = existingPages[0];
+
+    // 2. 监听 context 的 'page' 事件，提前注册，确保不漏掉新页面
+    let resolveNewPage: (p: Page) => void;
+    const newPagePromise = new Promise<Page>(resolve => { resolveNewPage = resolve; });
+    context.once('page', (page: Page) => resolveNewPage(page));
+
+    // 3. 通过 CDP 在后台创建 tab
+    //    background:true  — 不激活该 tab（不切换 Chrome 内部焦点到新 tab）
+    //    focus:false      — 实验性参数（Chrome 112+），进一步阻止窗口级焦点转移
+    //                       Playwright 类型定义未收录此参数，故用 Function 绕过类型检查
+    await (cdpSession.send as Function)('Target.createTarget', {
       url: 'about:blank',
       background: true,
-      hidden: true,
-    }) as { targetId: string };
-    await cdpSession.detach();
+      focus: false,
+    });
 
-    // 等待 Playwright context 捕获到这个 Target 对应的 Page（最多等 5 秒）
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      const pages = context.pages();
-      // Playwright 暴露的 page._guid / page._channel 里可通过内部 targetId 匹配
-      // 更可靠的方式：通过 page.url() + 时序来找最新的 about:blank
-      const page = pages.find(p => {
-        // @ts-ignore — 访问 Playwright 内部属性拿 targetId
-        return (p as any)._channel?._object?.targetId === targetId
-          || (p as any)._targetId === targetId;
-      });
-      if (page) {
-        console.log('✅ Background page created via CDP (no focus steal)');
-        return page;
+    // 4. 等待 Playwright 捕获到新 page（最多等 5 秒）
+    const page = await Promise.race([
+      newPagePromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Timeout waiting for new page event')), 5000)
+      ),
+    ]);
+
+    // 5. 双重保险：用 CDP activateTarget 把 Chrome 内部焦点切回原来的 tab
+    //    注意：这里故意不用 bringToFront()，因为那会把 Chrome 窗口拉到最前面
+    //    activateTarget 只切换 Chrome 内部 tab，不会激活 Chrome 应用窗口
+    if (firstExistingPage) {
+      try {
+        // 从 page 的内部 _guid 中拿不到 targetId，所以通过 CDP getTargets 找旧 page 对应的 targetId
+        const { targetInfos } = await cdpSession.send('Target.getTargets') as {
+          targetInfos: Array<{ targetId: string; type: string; url: string }>;
+        };
+        const firstPageUrl = firstExistingPage.url();
+        const originalTarget = targetInfos.find(t => t.type === 'page' && t.url === firstPageUrl);
+        if (originalTarget) {
+          await cdpSession.send('Target.activateTarget', { targetId: originalTarget.targetId });
+        }
+      } catch {
+        // 切回焦点失败不影响主流程
       }
-      await new Promise(r => setTimeout(r, 50));
     }
 
-    // 匹配不到则找最后一个 about:blank 页面（时序兜底）
-    const pages = context.pages();
-    const blankPage = [...pages].reverse().find(p => p.url() === 'about:blank');
-    if (blankPage) {
-      console.log('✅ Background page found via about:blank fallback');
-      return blankPage;
-    }
+    await cdpSession.detach();
+    console.log('✅ Background page created via CDP (focus preserved)');
+    return page;
 
-    throw new Error('CDP background page created but not found in context');
   } catch (err) {
-    // 回退：旧版 Chrome 或 hidden 参数不支持时，用标准 newPage（会抢焦点）
+    // 清理 CDP session
+    if (cdpSession) {
+      try { await cdpSession.detach(); } catch { /* ignore */ }
+    }
+    // 兜底：用标准 newPage（会抢焦点）
     console.warn('⚠️ CDP background page failed, falling back to newPage():', (err as Error).message);
     return context.newPage();
   }
