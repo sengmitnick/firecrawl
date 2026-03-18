@@ -46,15 +46,21 @@ let browser: Browser;
 let context: BrowserContext;
 
 /**
- * 在后台创建新 Tab，尽量不抢占用户焦点。
+ * 在后台创建新 Tab，不抢占用户焦点。
  *
- * 策略（三层）：
- * 1. CDP Target.createTarget + background:true + focus:false
- *    - background:true  — Chrome 不切换到该 tab
- *    - focus:false      — 实验性参数（Chrome 112+），进一步阻止焦点转移
- *    - 创建前记录当前活跃 tab，创建后立刻 activateTarget 切回去（双重保险）
- *    - 通过 context 的 'page' 事件可靠获取 Page 对象（不依赖内部属性）
- * 2. 若以上失败，直接用 context.newPage()（会抢焦点，最后兜底）
+ * 关键：根据 CDP 官方文档，防止焦点抢占的正确参数组合是：
+ *   background:false + focus:false（实验性，Chrome 112+）
+ *   → "the browser window remain unchanged (if it was in the background, it will remain in the background)"
+ *
+ * 注意：background:true 并不能完全阻止窗口级焦点转移（Chromium bug #474238399），
+ *       必须使用 focus:false 才能真正阻止 Chrome 窗口被激活。
+ *
+ * 流程：
+ * 1. 提前注册 context 的 'page' 事件（可靠捕获新 Page，不依赖内部属性）
+ * 2. CDP Target.createTarget(background:false, focus:false)
+ * 3. 等待 page 事件触发，获取新 Page 对象
+ * 4. 用 CDP Target.activateTarget 切回原 tab（双重保险）
+ * 5. 若以上失败，兜底用 context.newPage()（会抢焦点）
  */
 const newBackgroundPage = async (): Promise<Page> => {
   let cdpSession: import('playwright-core').CDPSession | null = null;
@@ -71,12 +77,20 @@ const newBackgroundPage = async (): Promise<Page> => {
     context.once('page', (page: Page) => resolveNewPage(page));
 
     // 3. 通过 CDP 在后台创建 tab
-    //    background:true  — 不激活该 tab（不切换 Chrome 内部焦点到新 tab）
-    //    focus:false      — 实验性参数（Chrome 112+），进一步阻止窗口级焦点转移
-    //                       Playwright 类型定义未收录此参数，故用 Function 绕过类型检查
+    //
+    //    ⚠️ 根据 CDP 官方文档的精确语义（实验性参数，Chrome 112+）：
+    //       - background=false + focus=false
+    //         → tab 被创建，但浏览器窗口保持不变（不激活 Chrome 窗口，不切换 tab）
+    //         → 这才是"不抢焦点"的正确组合！
+    //       - background=true  → 不切换 Chrome 内部 active tab，但窗口可能仍被激活
+    //       - background=false + focus=undefined → 窗口会被聚焦（抢焦点）
+    //       - background=true + focus=true → 报错，不支持
+    //
+    //    结论：必须用 background:false + focus:false，而不是 background:true
+    //    Playwright 类型定义未收录 focus 参数，故用 Function 绕过类型检查
     await (cdpSession.send as Function)('Target.createTarget', {
       url: 'about:blank',
-      background: true,
+      background: false,
       focus: false,
     });
 
