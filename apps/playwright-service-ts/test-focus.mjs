@@ -113,10 +113,10 @@ async function step(label, fn) {
     });
   }
 
-  // ── STEP 6: cdpSession.detach ──
-  await step('cdpSession.detach()', async () => {
-    await cdpSession.detach();
-  });
+  // ── 注意：不调用 cdpSession.detach() ──
+  // detach() 本身就是抢焦点的元凶！它会触发 Chrome debugger-detached 事件，
+  // Chrome 借机在 OS 层面激活窗口。修复方案：全局复用 session，永不 detach。
+  console.log('\n⏭️  跳过 cdpSession.detach()（这步是抢焦点的元凶，已从正式代码中移除）');
 
   // ── 清理 ──
   console.log('\n─── 清理阶段（关闭新 page）───');
@@ -125,7 +125,8 @@ async function step(label, fn) {
     console.log('✅ 新 page 已关闭');
   }
 
+  // 测试脚本里关闭 browser 时 session 会自动结束，正式代码里不会关闭 browser
   await browser.close();
   console.log('\n=== 诊断完成 ===');
-  console.log('请告知：哪一步执行后 Chrome 弹出来了？');
+  console.log('✅ 去掉 detach() 后，整个流程应该不再抢焦点！');
 })();

@@ -21,10 +21,27 @@ const { chromium } = pkg;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ========== 完整复制 api.ts 里的 newBackgroundPage() 逻辑 ==========
+// 关键修复：CDP session 全局复用，永不 detach！
+// detach() 本身是抢焦点的元凶——它触发 Chrome debugger-detached 事件，
+// Chrome 借机在 OS 层面激活窗口。
+let sharedCdpSession = null;
+
+async function getSharedCdpSession(browser) {
+  if (sharedCdpSession) {
+    try {
+      await sharedCdpSession.send('Target.getTargets');
+      return sharedCdpSession;
+    } catch {
+      sharedCdpSession = null;
+    }
+  }
+  sharedCdpSession = await browser.newBrowserCDPSession();
+  return sharedCdpSession;
+}
+
 async function newBackgroundPage(browser, context) {
-  let cdpSession = null;
   try {
-    cdpSession = await browser.newBrowserCDPSession();
+    const cdpSession = await getSharedCdpSession(browser);
 
     // 1. 记录创建前已存在的 pages
     const existingPages = context.pages();
@@ -41,7 +58,6 @@ async function newBackgroundPage(browser, context) {
 
     // 3. CDP 后台创建 tab
     // 根据 CDP 文档：background:false + focus:false 才是不抢焦点的正确组合
-    // background:true + focus:false 仍可能激活 Chrome 窗口（Chromium bug #474238399）
     console.log(`  [newBackgroundPage] 发送 Target.createTarget(background:false, focus:false)...`);
     await cdpSession.send('Target.createTarget', {
       url: 'about:blank',
@@ -67,7 +83,6 @@ async function newBackgroundPage(browser, context) {
           await cdpSession.send('Target.activateTarget', { targetId: originalTarget.targetId });
         } else {
           console.log(`  [newBackgroundPage] ⚠️ 找不到原 tab URL: ${firstPageUrl.slice(0,40)}`);
-          console.log(`  可用 page targets:`);
           targetInfos.filter(t => t.type === 'page').forEach(t =>
             console.log(`    - ${t.url.slice(0,50)}`)
           );
@@ -77,12 +92,12 @@ async function newBackgroundPage(browser, context) {
       }
     }
 
-    await cdpSession.detach();
-    console.log(`  [newBackgroundPage] ✅ 完成（焦点应该没被抢）`);
+    // ⚠️ 故意不调用 cdpSession.detach()！这就是修复的核心。
+    console.log(`  [newBackgroundPage] ✅ 完成（不 detach，焦点应该没被抢）`);
     return page;
 
   } catch (err) {
-    if (cdpSession) { try { await cdpSession.detach(); } catch {} }
+    sharedCdpSession = null; // 让下次重建
     console.warn(`  [newBackgroundPage] ⚠️ 失败，回退到 newPage():`, err.message);
     return context.newPage();
   }

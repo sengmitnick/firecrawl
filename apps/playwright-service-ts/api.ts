@@ -45,6 +45,30 @@ interface UrlModel {
 let browser: Browser;
 let context: BrowserContext;
 
+// 全局复用的浏览器级 CDP session
+// 关键：每次 newBrowserCDPSession() 后 detach() 会触发 OS 窗口激活（焦点抢占）
+// 所以全程只建一次 session，用完不 detach，彻底规避这个问题
+let sharedCdpSession: import('playwright-core').CDPSession | null = null;
+
+/**
+ * 获取（或懒初始化）全局共享的浏览器级 CDP session。
+ * 若 session 已断开则重建。
+ */
+const getSharedCdpSession = async (): Promise<import('playwright-core').CDPSession> => {
+  if (sharedCdpSession) {
+    // 检查 session 是否还活着（发一个轻量级命令）
+    try {
+      await sharedCdpSession.send('Target.getTargets');
+      return sharedCdpSession;
+    } catch {
+      // session 已断开，重建
+      sharedCdpSession = null;
+    }
+  }
+  sharedCdpSession = await browser.newBrowserCDPSession();
+  return sharedCdpSession;
+};
+
 /**
  * 在后台创建新 Tab，不抢占用户焦点。
  *
@@ -52,20 +76,21 @@ let context: BrowserContext;
  *   background:false + focus:false（实验性，Chrome 112+）
  *   → "the browser window remain unchanged (if it was in the background, it will remain in the background)"
  *
- * 注意：background:true 并不能完全阻止窗口级焦点转移（Chromium bug #474238399），
- *       必须使用 focus:false 才能真正阻止 Chrome 窗口被激活。
+ * 另一个重要原则：CDP session 全局复用，永远不 detach。
+ *   原因：cdpSession.detach() 本身会触发 Chrome 内部的 debugger-detached 事件，
+ *         Chrome 在某些情况下会借机把窗口激活（OS 层面），这就是焦点被抢的真正根因。
  *
  * 流程：
- * 1. 提前注册 context 的 'page' 事件（可靠捕获新 Page，不依赖内部属性）
- * 2. CDP Target.createTarget(background:false, focus:false)
- * 3. 等待 page 事件触发，获取新 Page 对象
- * 4. 用 CDP Target.activateTarget 切回原 tab（双重保险）
- * 5. 若以上失败，兜底用 context.newPage()（会抢焦点）
+ * 1. 获取全局共享 CDP session（不每次新建+detach）
+ * 2. 提前注册 context 的 'page' 事件（可靠捕获新 Page）
+ * 3. CDP Target.createTarget(background:false, focus:false)
+ * 4. 等待 page 事件触发，获取新 Page 对象
+ * 5. 用 CDP Target.activateTarget 切回原 tab（双重保险）
+ * 6. 若以上失败，兜底用 context.newPage()（会抢焦点）
  */
 const newBackgroundPage = async (): Promise<Page> => {
-  let cdpSession: import('playwright-core').CDPSession | null = null;
   try {
-    cdpSession = await browser.newBrowserCDPSession();
+    const cdpSession = await getSharedCdpSession();
 
     // 1. 记录创建前已存在的 pages（用于事后恢复焦点到其中第一个）
     const existingPages = context.pages();
@@ -107,7 +132,6 @@ const newBackgroundPage = async (): Promise<Page> => {
     //    activateTarget 只切换 Chrome 内部 tab，不会激活 Chrome 应用窗口
     if (firstExistingPage) {
       try {
-        // 从 page 的内部 _guid 中拿不到 targetId，所以通过 CDP getTargets 找旧 page 对应的 targetId
         const { targetInfos } = await cdpSession.send('Target.getTargets') as {
           targetInfos: Array<{ targetId: string; type: string; url: string }>;
         };
@@ -121,17 +145,18 @@ const newBackgroundPage = async (): Promise<Page> => {
       }
     }
 
-    await cdpSession.detach();
+    // ⚠️ 不调用 cdpSession.detach()！
+    // detach 会触发 Chrome 的 debugger-detached 事件，导致 OS 窗口被激活（抢焦点）。
+    // 全局 session 会一直存活，由 getSharedCdpSession() 管理生命周期。
+
     console.log('✅ Background page created via CDP (focus preserved)');
     return page;
 
   } catch (err) {
-    // 清理 CDP session
-    if (cdpSession) {
-      try { await cdpSession.detach(); } catch { /* ignore */ }
-    }
     // 兜底：用标准 newPage（会抢焦点）
     console.warn('⚠️ CDP background page failed, falling back to newPage():', (err as Error).message);
+    // session 可能已损坏，清理让下次重建
+    sharedCdpSession = null;
     return context.newPage();
   }
 };
